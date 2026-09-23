@@ -9,6 +9,8 @@ Frontend for the Elektrokomplekt LLP supplier-order planning workflow. The app p
 - **Data flow:** the manager selects warehouse/category and presses **Рассчитать потребность**. The frontend POSTs the scope, displays the returned recommendations and their backend-provided rationale, and permits quantity edits. Every line must be checked as reviewed before **Подтвердить заказ** is enabled. That explicit action marks the displayed recommendations approved in the frontend. Only then is CSV export enabled.
 - **Safety:** no auto-send/dispatch code path exists. Export is local CSV download, never supplier delivery. The REST adapter maps an allow-list of fields into the UI model, rejects invalid records and rejects obvious PII indicators (email, phone-like strings, customer/contact keywords) without echoing the suspect value. Do not add raw API payload logging or pass arbitrary backend fields through the UI/export.
 
+`src/components/OrderApprovalDashboard.vue` is a standalone Vue 3 Composition API version of the manager order workflow. The deployed dashboard entry point remains the React app in `src/ui`; the Vue SFC is not imported into that React tree and expects a Vue-enabled host.
+
 ## API integration contract (frontend expectation)
 
 Configure `VITE_API_BASE_URL` as the backend origin. Requests use JSON and a 15-second timeout. Errors are shown to the user; the previous result remains visible if recalculation fails.
@@ -32,7 +34,10 @@ Configure `VITE_API_BASE_URL` as the backend origin. Requests use JSON and a 15-
       "stock": 8,
       "monthlyUse": 15,
       "leadDays": 21,
-      "justification": "backend-generated explanation"
+      "justification": "backend-generated explanation",
+      "seasonality": "backend-provided optional note",
+      "moq": 12,
+      "status": "pending"
     }
   ]
 }
@@ -46,13 +51,19 @@ Request (scope fields are optional):
 { "warehouse": "warehouse name/code", "category": "category" }
 ```
 
-Response has the same `lines` structure as `GET /api/orders`, optionally with `calculationId` and `calculatedAt`. The backend owns scope interpretation, recommendation calculation, stock and trend values, urgency, BOM/SKU mapping, and justification. If Executor 1's final contract differs, update `src/data/api.ts` and this section before integration.
+Response has the same `lines` structure as `GET /api/orders`, optionally with `calculationId` and `calculatedAt`. The backend owns scope interpretation, recommendation calculation, stock and trend values, urgency, BOM/SKU mapping, and justification. Optional seasonality and MOQ fields may be supplied for display. If Executor 1's final contract differs, update `src/data/api.ts` and this section before integration.
 
-Approval is a frontend confirmation step in this demo contract; the backend does not expose an approval or dispatch endpoint here. For production, persist the responsible user and approval event through a separately documented backend endpoint before treating approval as durable. The current UI does not claim remote persistence.
+### POST /api/orders/approve
+
+A procurement manager must review every displayed line and explicitly confirm it. The frontend sends adjusted quantities as { lines: [{ id, quantity }] }. Only a successful 2xx response marks lines approved. The backend must persist the authenticated approver, time, quantities, and audit event. The UI never calls a supplier-dispatch endpoint.
 
 ## 1C export
 
-Export is UTF-8 with BOM, semicolon-delimited CSV and quoted values. Columns are `SKU;BOM_ID;WAREHOUSE;SUPPLIER;QUANTITY;UNIT`, using backend-provided SKU/BOM identifiers. Only lines marked approved by the visible human confirmation action are included. Confirm these column names, delimiters, warehouse/supplier reference formats, and BOM key semantics with the Elektrokomplekt 1C import specification before production use; the final 1C mapping document was not present in the supplied project folder.
+GET /api/orders/export-1c returns CSV for approved orders. The frontend validates the CSV content type, UTF-8 semicolon-delimited rows, exact SKU;BOM_ID;WAREHOUSE;SUPPLIER;QUANTITY;UNIT headers, field counts, and obvious PII indicators before download. Unexpected data is rejected without exposing the body. The backend must return approved orders only. Confirm the mapping against the partner 1C template before production.
+
+### POST /api/upload
+
+The frontend sends one multipart file field named file. It accepts XLSX, XLS, and CSV files up to 25 MB and does not display or log the selected filename or contents. The backend should validate and anonymize partner reports before returning data to the UI.
 
 ## Replenishment methodology and outlier exclusion
 
@@ -60,7 +71,7 @@ Export is UTF-8 with BOM, semicolon-delimited CSV and quoted values. Columns are
 
 ## Setup and run
 
-Requirements: Node.js 20+ and npm.
+Requirements: Node.js 20+ and npm. Install dependencies once at the repository root for the existing Tailwind/daisyUI toolchain, then run the frontend scripts from the frontend directory.
 
 ```sh
 npm install
@@ -81,9 +92,9 @@ Backend setup/run instructions must be supplied by Executor 1; no backend source
 ## Known limitations and assumptions
 
 - API schema above is the frontend's explicit provisional contract, not a discovered backend contract. Reconcile it with Executor 1 before integration.
-- Approval state is in browser memory only; reload loses it. The demo is not a substitute for durable, authenticated, auditable approval in production.
+- The frontend treats a successful 2xx approval response as accepted. The backend must enforce authorization and persist the approval audit record.
 - The CSV headers are a documented provisional 1C mapping, not verified against a provided partner import template.
 - PII filtering detects common email/phone/contact indicators. Backend data should be anonymized at source and reviewed against the contract; heuristic checks cannot guarantee detection of every sensitive value.
 - Stock trends in this UI show backend-provided current stock, monthly use and lead time; the demo does not construct historical trend series.
-- No authentication/authorization or supplier dispatch is included.
+- Authentication/authorization and supplier dispatch are outside this frontend; the backend must authorize approvals and validate/anonymize uploaded reports.
 - The supplied source folder had workbooks but no API service, backend technical write-up, or 1C interface specification.
