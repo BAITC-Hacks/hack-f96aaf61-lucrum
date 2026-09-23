@@ -176,6 +176,14 @@ def test_upload_xlsx_reloads_dataset_and_stores_safe_filename(client, tmp_path):
     assert body["filename"].endswith(".xlsx")
     assert (tmp_path / "raw" / body["filename"]).is_file()
     assert body["counts"]["sales"] == 24
+    assert body["recommendation_count"] == 2
+
+    calculation = client.post("/api/calculate")
+    assert calculation.status_code == 200
+    result = calculation.json()
+    assert result["api_version"] == "v1"
+    assert result["run_id"]
+    assert len(result["orders"]) == 2
 
 
 def test_upload_rejects_non_xlsx_files(client):

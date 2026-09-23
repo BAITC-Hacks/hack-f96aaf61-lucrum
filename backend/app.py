@@ -94,8 +94,17 @@ def health() -> dict[str, str]:
 @app.post("/api/calculate")
 def calculate_orders(warehouse: str | None = None, category: str | None = None) -> dict[str, Any]:
     global _last_calculation
-    result = calculate(_dataset, warehouse, category)
-    _last_calculation = _db().save_calculation(result["orders"])
+    try:
+        result = calculate(_dataset, warehouse, category)
+        _last_calculation = _db().save_calculation(result["orders"])
+    except HTTPException:
+        raise
+    except sqlite3.Error as exc:
+        logger.exception("Unable to persist calculation results")
+        raise HTTPException(status_code=503, detail="Calculation completed but its results could not be saved") from exc
+    except (TypeError, ValueError) as exc:
+        logger.exception("Calculation failed for warehouse=%s category=%s", warehouse, category)
+        raise HTTPException(status_code=422, detail="The active dataset could not be calculated; check the workbook schema and values") from exc
     return _last_calculation
 
 
@@ -187,7 +196,11 @@ async def upload_report(file: UploadFile = File(...)) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="File is not a readable XLSX ZIP container") from exc
 
     raw_dir = _raw_dir()
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        raw_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.exception("Unable to create XLSX raw-data directory %s", raw_dir)
+        raise HTTPException(status_code=500, detail="The server could not access the configured raw-data directory") from exc
     stem = (re.sub(r"[^\w.-]+", "_", Path(basename).stem, flags=re.UNICODE).strip("._")
             or "partner_report")[:100]
     destination = raw_dir / f"{stem}-{uuid.uuid4().hex[:10]}.xlsx"
@@ -197,16 +210,38 @@ async def upload_report(file: UploadFile = File(...)) -> dict[str, Any]:
         os.replace(temporary, destination)
         try:
             updated_dataset = load_dataset(raw_dir, fallback_on_error=False)
-            calculate(updated_dataset)  # validate the loaded records before activation
+            if not updated_dataset.sales:
+                raise ValueError("No usable sales rows were found. Include a SKU, month/date, and quantity in the sales workbook.")
+            if not updated_dataset.suppliers:
+                raise ValueError("No supplier mapping was found for the loaded products. Include supplier codes or a recognized vendor workbook.")
+            preview = calculate(updated_dataset)  # validate the loaded records before activation
         except Exception as exc:
             destination.unlink(missing_ok=True)
-            raise HTTPException(status_code=422, detail=f"Workbook could not be loaded: {type(exc).__name__}") from exc
+            reason = str(exc).strip() or type(exc).__name__
+            logger.warning("XLSX upload rejected for %s: %s", destination.name, reason)
+            raise HTTPException(status_code=422, detail=f"Workbook could not be loaded: {reason[:500]}") from exc
+        try:
+            _db().save_calculation([])  # invalidate approvals before activating the replacement dataset
+        except sqlite3.Error as exc:
+            destination.unlink(missing_ok=True)
+            logger.exception("Unable to invalidate recommendations after XLSX upload")
+            raise HTTPException(status_code=503, detail="The workbook parsed, but prior recommendations could not be invalidated; the upload was not activated") from exc
         set_dataset(updated_dataset)
-        _db().save_calculation([])  # invalidate prior approvals after the source dataset changes
+        logger.info("Activated XLSX upload %s: sales=%d stock=%d suppliers=%d preview_orders=%d",
+                    destination.name, len(updated_dataset.sales), len(updated_dataset.stock),
+                    len(updated_dataset.suppliers), len(preview["orders"]))
+    except HTTPException:
+        destination.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        destination.unlink(missing_ok=True)
+        logger.exception("Unable to save XLSX upload into %s", raw_dir)
+        raise HTTPException(status_code=500, detail="The server could not save the uploaded workbook") from exc
     finally:
         temporary.unlink(missing_ok=True)
         await file.close()
     return {"api_version": "v1", "filename": destination.name, "reloaded": True,
+            "recommendation_count": len(preview["orders"]),
             "counts": {"sales": len(updated_dataset.sales), "stock": len(updated_dataset.stock),
                        "transit": len(updated_dataset.transit), "suppliers": len(updated_dataset.suppliers),
                        "products": len(updated_dataset.products), "stockouts": len(updated_dataset.stockouts)}}
