@@ -1,42 +1,486 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Activity, ArrowUpRight, Boxes, Check, ChevronDown, CircleAlert, ClipboardCheck, Clock3, Download, FileSpreadsheet, Layers3, PackageCheck, RefreshCw, ShieldCheck, SlidersHorizontal, Warehouse as WarehouseIcon } from 'lucide-react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import {
+  Activity, Bell, Boxes, Check, ChevronDown, CircleAlert, ClipboardCheck,
+  Download, FileSpreadsheet, LayoutDashboard, Layers3, PackageCheck,
+  RefreshCw, Search, Settings, ShieldCheck, SlidersHorizontal,
+  Warehouse as WarehouseIcon,
+} from 'lucide-react';
 import { Badge } from '../components/ui/Badge';
 import { BarList } from '../components/ui/BarList';
 import { Card } from '../components/ui/Card';
-import { approveOrders, calculate, exportOrders, getOrders, isMock, uploadReport } from '../data/api';
+import { approveOrders, calculate, checkHealth, exportOrders, getOrders, getStock, isMock, mergeStock, uploadReport } from '../data/api';
 import type { OrderLine, Urgency } from '../data/types';
 
 const money = new Intl.NumberFormat('ru-RU');
-const urgencyName: Record<Urgency,string> = {critical:'Срочно',soon:'Скоро',planned:'Планово'};
-export default function App(){
- const [lines,setLines]=useState<OrderLine[]>([]); const [warehouse,setWarehouse]=useState('Все склады'); const [category,setCategory]=useState('Все категории');
- const [busy,setBusy]=useState(false); const [error,setError]=useState(''); const [exportBusy,setExportBusy]=useState(false); const [now,setNow]=useState(new Date()); const [uploadBusy,setUploadBusy]=useState(false); const [uploadMessage,setUploadMessage]=useState(''); const [dragging,setDragging]=useState(false);
- const warehouses=useMemo(()=>['Все склады',...new Set(lines.map(x=>x.warehouse))],[lines]); const categories=useMemo(()=>['Все категории',...new Set(lines.map(x=>x.category))],[lines]);
- useEffect(()=>{let active=true;getOrders().then(data=>{if(active)setLines(data)}).catch(e=>{if(active)setError(e instanceof Error?e.message:'Не удалось загрузить заказы.')});return()=>{active=false}},[]);
- const filtered=lines.filter(x=>(warehouse==='Все склады'||x.warehouse===warehouse)&&(category==='Все категории'||x.category===category));
- const urgent=filtered.filter(x=>x.urgency==='critical').length; const qty=filtered.reduce((n,x)=>n+x.quantity,0); const ready=filtered.filter(x=>x.reviewed).length; const allApproved=filtered.length>0&&filtered.every(x=>x.status==='approved');
- const suppliers=Array.from(new Set(filtered.map(x=>x.supplier))).map(name=>({name,count:filtered.filter(x=>x.supplier===name).length,units:filtered.filter(x=>x.supplier===name).reduce((n,x)=>n+x.quantity,0)}));
- const categoriesSummary=Array.from(new Set(filtered.map(x=>x.category))).map(name=>({name,count:filtered.filter(x=>x.category===name).length,units:filtered.filter(x=>x.category===name).reduce((n,x)=>n+x.quantity,0)}));
- async function run(){setBusy(true);setError('');try{const next=await calculate({warehouse:warehouse==='Все склады'?undefined:warehouse,category:category==='Все категории'?undefined:category});setLines(next);setNow(new Date());}catch(e){setError(e instanceof Error?e.message:'Не удалось выполнить расчёт.');}finally{setBusy(false);}}
- function patch(id:string, updates:Partial<OrderLine>){setLines(prev=>prev.map(x=>x.id===id&&x.status!=='approved'?{...x,...updates,...('quantity'in updates?{reviewed:false}:{}),status:'pending'}:x));}
- async function approve(){if(!filtered.length||filtered.some(x=>!x.reviewed)){setError('Перед подтверждением проверьте и отметьте каждую строку.');return;}setBusy(true);setError('');try{await approveOrders(filtered);setLines(prev=>prev.map(x=>filtered.some(y=>y.id===x.id)?{...x,status:'approved'}:x));}catch(e){setError(e instanceof Error?e.message:'Не удалось отправить согласование.');}finally{setBusy(false);}}
- async function exportCsv(){if(!allApproved){setError('Сначала подтвердите отображаемые позиции менеджером.');return;}setExportBusy(true);setError('');try{const blob=await exportOrders();const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`orders-1c-${new Date().toISOString().slice(0,10)}.csv`;a.click();window.setTimeout(()=>URL.revokeObjectURL(url),1000);}catch(e){setError(e instanceof Error?e.message:'Не удалось выгрузить файл для 1С.');}finally{setExportBusy(false);}}
- async function handleUpload(file?:File){if(!file)return;if(!/\.(xlsx|xls|csv)$/i.test(file.name)){setError('Поддерживаются файлы XLSX, XLS и CSV.');return;}if(file.size>25*1024*1024){setError('Размер файла превышает лимит 25 МБ.');return;}setUploadBusy(true);setUploadMessage('');setError('');try{await uploadReport(file);setUploadMessage('Файл передан backend для обработки. Запустите расчёт после завершения импорта.');}catch(e){setError(e instanceof Error?e.message:'Не удалось загрузить отчёт.');}finally{setUploadBusy(false);}}
- return <div className="app-shell"><aside className="sidebar"><a className="brand" href="#"><span className="brand-mark"><Layers3 size={19}/></span><span>Kontur<span className="brand-sub">PROCUREMENT INTELLIGENCE</span></span></a><div className="side-caption">РАБОЧЕЕ ПРОСТРАНСТВО</div><nav><a className="nav-item active"><Boxes size={17}/>Заказы <span className="nav-count">{filtered.length}</span></a><a className="nav-item"><Activity size={17}/>Аналитика</a><a className="nav-item"><WarehouseIcon size={17}/>Склады</a></nav><div className="sidebar-bottom"><span className="status-dot"/>Сервис подключён <span className="version">v0.9</span></div></aside>
- <main className="main"><header className="topbar"><div className="breadcrumb">Закупки <span>/</span> Рекомендации</div><div className="top-actions"><span className="today">{new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'long',year:'numeric'}).format(now)}</span><div className="avatar">МЗ</div></div></header>
- <div className="content"><div className="heading-row"><div><div className="eyebrow">УПРАВЛЕНИЕ ПОПОЛНЕНИЕМ <span className="live-dot"/></div><h1>Рекомендации к заказу</h1><p className="subtitle">Проверьте потребность, скорректируйте объём и подтвердите заказ вручную.</p></div><button className="primary run-button" onClick={run} disabled={busy}><RefreshCw size={16} className={busy?'spin':''}/>{busy?'Считаем…':'Рассчитать потребность'}</button></div>
- {isMock&&<div className="mock-banner"><CircleAlert size={16}/><span><b>Демо-режим</b> · Синтетические данные для разработки. Подключите API через <code>VITE_API_BASE_URL</code>.</span></div>}
- {error&&<div className="error-banner"><CircleAlert size={17}/>{error}<button onClick={()=>setError('')} aria-label="Закрыть">×</button></div>}
- <section className="filters card"><div className="filter-title"><SlidersHorizontal size={16}/> ПАРАМЕТРЫ РАСЧЁТА</div><label className="select-wrap"><WarehouseIcon size={15}/><select value={warehouse} onChange={e=>setWarehouse(e.target.value)}>{warehouses.map(x=><option key={x}>{x}</option>)}</select><ChevronDown size={14}/></label><label className="select-wrap"><Layers3 size={15}/><select value={category} onChange={e=>setCategory(e.target.value)}>{categories.map(x=><option key={x}>{x}</option>)}</select><ChevronDown size={14}/></label><span className="filter-hint">Фильтры применятся к следующему расчёту</span></section>
- <section className={`upload-panel card ${dragging?'is-dragging':''}`} onDragOver={e=>{e.preventDefault();setDragging(true)}} onDragLeave={()=>setDragging(false)} onDrop={e=>{e.preventDefault();setDragging(false);void handleUpload(e.dataTransfer.files[0])}}><div className="upload-icon"><FileSpreadsheet size={19}/></div><div className="upload-copy"><b>Загрузить отчёт партнёра</b><span>Excel-файл обновит исходные данные для следующего расчёта</span>{uploadMessage&&<em>{uploadMessage}</em>}</div><label className="btn btn-sm upload-button">{uploadBusy?'Загрузка…':'Выбрать Excel'}<input className="file-input file-input-sm" type="file" accept=".xlsx,.xls,.csv" hidden onChange={e=>{void handleUpload(e.target.files?.[0]);e.currentTarget.value=''}}/></label></section>
- <section className="metrics"><Metric label="ПОЗИЦИЙ К ЗАКАЗУ" value={String(filtered.length).padStart(2,'0')} sub={`${ready} из ${filtered.length} проверено`} icon={<ClipboardCheck/>} accent="green"/><Metric label="ЕДИНИЦ К ЗАКАЗУ" value={money.format(qty)} sub="По текущим рекомендациям" icon={<Boxes/>} accent="blue"/><Metric label="ТРЕБУЮТ ВНИМАНИЯ" value={String(urgent).padStart(2,'0')} sub="Критичный уровень остатка" icon={<CircleAlert/>} accent="orange"/></section>
- <div className="section-head"><div><h2>План пополнения</h2><p>Персональный план на основе актуальных остатков</p></div><div className="head-actions"><span className="updated"><span className="status-dot"/> Обновлено {new Intl.DateTimeFormat('ru-RU',{hour:'2-digit',minute:'2-digit'}).format(now)}</span><button className="quiet-button" onClick={exportCsv} disabled={!allApproved||exportBusy}><Download size={15}/>{exportBusy?'Готовим…':'Экспорт в 1С'}</button></div></div>
- <section className="table-card card"><div className="table-toolbar"><div className="tabs"><span className="tab active">Все позиции <b>{filtered.length}</b></span><span className="tab">На проверке <b>{filtered.filter(x=>!x.reviewed).length}</b></span><span className="tab">Подтверждены <b>{filtered.filter(x=>x.status==='approved').length}</b></span></div><div className="supplier-note"><span className="status-dot"/> Группировка по поставщику включена</div><form className="search-form" method="get"><label htmlFor="project-search">Search projects</label><div className="join"><input className="input input-sm join-item" id="project-search" name="q" type="search" placeholder="SKU или название"/><button className="btn btn-primary btn-sm join-item" type="submit">Search</button></div></form></div>
- <div className="table-scroll"><table><thead><tr><th>ПОЗИЦИЯ</th><th>ПОСТАВЩИК</th><th>ОСТАТОК / ТРЕНД</th><th>РЕКОМЕНДАЦИЯ</th><th>СРОЧНОСТЬ</th><th>ПРОВЕРКА</th></tr></thead><tbody>{Array.from(new Set(filtered.map(x=>x.supplier))).flatMap(supplier=>[<tr className="supplier-group" key={`${supplier}-group`}><td colSpan={6}><b>{supplier}</b><span>{filtered.filter(x=>x.supplier===supplier).length} позиции · {filtered.filter(x=>x.supplier===supplier).reduce((n,x)=>n+x.quantity,0)} ед.</span></td></tr>,...filtered.filter(x=>x.supplier===supplier).map(line=><tr key={line.id}><td><div className="product"><div className="product-icon"><PackageCheck size={17}/></div><div><b>{line.product}</b><span>{line.sku} <i>·</i> {line.category}</span></div></div></td><td><span className="supplier-name">{line.supplier}</span><span className="warehouse-name">{line.warehouse}</span></td><td><div className="stock"><b>{line.stock} <small>{line.unit}</small></b><span><Activity size={13}/> {line.monthlyUse}/мес. · {line.leadDays} дн.</span><div className="stock-track"><i style={{width:`${Math.min(100,line.stock/(line.monthlyUse||1)*100)}%`}}/></div></div></td><td><div className="quantity-control"><button aria-label="Уменьшить" disabled={line.status==='approved'} onClick={()=>patch(line.id,{quantity:Math.max(0,line.quantity-1)})}>−</button><input type="number" min="0" disabled={line.status==='approved'} value={line.quantity} onChange={e=>patch(line.id,{quantity:Math.max(0,Number(e.target.value))})}/><span>{line.unit}</span><button aria-label="Увеличить" disabled={line.status==='approved'} onClick={()=>patch(line.id,{quantity:line.quantity+1})}>+</button></div><span className="reason" title={line.justification + (line.seasonality ? ' · Сезонность: ' + line.seasonality : '') + (line.moq ? ' · MOQ: ' + line.moq : '')}>{line.justification}{line.seasonality ? ' · Сезонность: ' + line.seasonality : ''}{line.moq ? ' · MOQ: ' + line.moq : ''}</span></td><td><Badge className={`urgency ${line.urgency}`} variant={line.urgency==='critical'?'error':line.urgency==='soon'?'warning':'success'}><i/>{urgencyName[line.urgency]}</Badge></td><td><button className={`review ${line.reviewed?'checked':''}`} disabled={line.status==='approved'} onClick={()=>patch(line.id,{reviewed:!line.reviewed})}>{line.reviewed?<Check size={14}/>:<span className="check-empty"/>}{line.status==='approved'?'Подтверждено':line.reviewed?'Проверено':'Проверить'}</button>{line.status==='approved'&&<span className="approved-mini"><ShieldCheck size={12}/>Подтверждено</span>}</td></tr>)])}</tbody></table>{!filtered.length&&<div className="empty">По заданным фильтрам ничего не найдено.</div>}</div>
- <div className="table-footer"><span>Показано {filtered.length} позиций</span><span><Clock3 size={13}/> Данные расчёта: {now.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'})}</span></div></section>
- <div className="lower-grid"><Card className="breakdown"><div className="panel-title"><div><h3>Распределение по категориям</h3><p>Структура объёма заказа</p></div><ArrowUpRight size={17}/></div><BarList data={categoriesSummary.map(item=>({name:`${item.name} · ${item.count} поз.`,value:item.units}))} valueFormatter={value=>`${money.format(value)} ед.`} sortOrder="descending" /></Card>
- <Card className="breakdown"><div className="panel-title"><div><h3>Поставщики</h3><p>Сводка рекомендованных заказов</p></div><ArrowUpRight size={17}/></div><BarList data={suppliers.map(item=>({name:`${item.name} · ${item.count} поз.`,value:item.units}))} valueFormatter={value=>`${money.format(value)} ед.`} sortOrder="descending" /></Card></div>
- <section className={`approval ${allApproved?'done':''}`}><div className="approval-icon">{allApproved?<ShieldCheck size={21}/>:<ClipboardCheck size={21}/>}</div><div className="approval-copy"><b>{allApproved?'Рекомендации подтверждены ответственным сотрудником':'Подтверждение менеджера по закупкам'}</b><span>{allApproved?'Backend зарегистрировал ручное согласование. Экспорт доступен; отправка поставщику не выполняется.':'Проверьте все строки и подтвердите заказ вручную. Это действие фиксирует согласование и открывает экспорт.'}</span></div><button className={allApproved?'quiet-button':'approve-button'} onClick={allApproved?exportCsv:approve} disabled={!filtered.length||filtered.some(x=>!x.reviewed)||busy||exportBusy}>{allApproved?<><FileSpreadsheet size={16}/>{exportBusy?'Готовим CSV…':'Скачать CSV для 1С'}</>:<><ShieldCheck size={16}/>{busy?'Подтверждаем…':'Подтвердить заказ'}</>}</button></section>
- <footer><span><ShieldCheck size={14}/> Отправка поставщикам отключена</span><span>Контур закупок <i>·</i> Инструмент планирования</span></footer></div></main></div>
+const urgencyName: Record<Urgency, string> = { critical: 'Высокая', soon: 'Средняя', planned: 'Плановая' };
+
+export default function App() {
+  const [lines, setLines] = useState<OrderLine[]>([]);
+  const [warehouse, setWarehouse] = useState('Все склады');
+  const [category, setCategory] = useState('Все категории');
+  const [supplier, setSupplier] = useState('Все поставщики');
+  const [urgency, setUrgency] = useState('Любая срочность');
+  const [approvalStatus, setApprovalStatus] = useState('Любой статус');
+  const [busy, setBusy] = useState(false);
+  const [calculating, setCalculating] = useState(false);
+  const [loadingOrders, setLoadingOrders] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [isStale, setIsStale] = useState(false);
+  const [selectedItemIds, setSelectedItemIds] = useState<string[]>([]);
+  const [error, setError] = useState('');
+  const [stockError, setStockError] = useState('');
+  const [runId, setRunId] = useState<string | null>(null);
+  const [serviceStatus, setServiceStatus] = useState<'demo' | 'checking' | 'online' | 'offline'>(isMock ? 'demo' : 'checking');
+  const [approvedBy, setApprovedBy] = useState('manager');
+  const [managerNote, setManagerNote] = useState('');
+  const [exportBusy, setExportBusy] = useState(false);
+  const [now, setNow] = useState(new Date());
+  const [uploadBusy, setUploadBusy] = useState(false);
+  const [uploadMessage, setUploadMessage] = useState('');
+  const [dragging, setDragging] = useState(false);
+
+  const warehouses = useMemo(() => ['Все склады', ...new Set(lines.map((line) => line.warehouse))], [lines]);
+  const categories = useMemo(() => ['Все категории', ...new Set(lines.map((line) => line.category))], [lines]);
+  const suppliers = useMemo(() => ['Все поставщики', ...new Set(lines.map((line) => line.supplierCode).filter(Boolean))], [lines]);
+
+  useEffect(() => {
+    let active = true;
+    checkHealth()
+      .then(() => { if (active) setServiceStatus(isMock ? 'demo' : 'online'); })
+      .catch(() => { if (active) setServiceStatus('offline'); });
+    getOrders()
+      .then(async (data) => {
+        if (!active) return;
+        setRunId(data.runId);
+        setNow(data.createdAt ? new Date(data.createdAt) : new Date());
+        setLines(data.lines);
+        try {
+          const stock = await getStock();
+          if (active) setLines(mergeStock(data.lines, stock));
+        } catch (cause: unknown) {
+          if (active) setStockError(cause instanceof Error ? cause.message : 'Не удалось загрузить складские остатки.');
+        }
+      })
+      .catch((cause: unknown) => { if (active) setError(cause instanceof Error ? cause.message : 'Не удалось загрузить заказы.'); })
+      .finally(() => { if (active) setLoadingOrders(false); });
+    return () => { active = false; };
+  }, []);
+
+  const filtered = lines.filter((line) =>
+    (warehouse === 'Все склады' || line.warehouse === warehouse)
+    && (category === 'Все категории' || line.category === category)
+    && (supplier === 'Все поставщики' || line.supplierCode === supplier)
+    && (urgency === 'Любая срочность' || line.urgency === urgency)
+    && (approvalStatus === 'Любой статус'
+      || (approvalStatus === 'Ожидают проверки' && !line.reviewed && line.status !== 'approved')
+      || (approvalStatus === 'Проверены' && line.reviewed && line.status !== 'approved')
+      || (approvalStatus === 'Подтверждены' && line.status === 'approved')),
+  );
+  const urgent = filtered.filter((line) => line.urgency === 'critical').length;
+  const quantity = filtered.reduce((sum, line) => sum + line.quantity, 0);
+  const reviewed = filtered.filter((line) => line.reviewed || line.status === 'approved').length;
+  const allApproved = filtered.length > 0 && filtered.every((line) => line.status === 'approved');
+  const hasApproved = lines.some((line) => line.status === 'approved');
+  const pendingVisible = filtered.filter((line) => line.status !== 'approved');
+  const selectedVisibleIds = pendingVisible.filter((line) => selectedItemIds.includes(line.id)).map((line) => line.id);
+  const allVisibleSelected = pendingVisible.length > 0 && selectedVisibleIds.length === pendingVisible.length;
+  const selectedPending = lines.filter((line) => selectedItemIds.includes(line.id) && line.status !== 'approved');
+  const categorySummary = Array.from(new Set(filtered.map((line) => line.category))).map((name) => ({
+    name,
+    count: filtered.filter((line) => line.category === name).length,
+    units: filtered.filter((line) => line.category === name).reduce((sum, line) => sum + line.quantity, 0),
+  }));
+  const supplierSummary = Array.from(new Set(filtered.map((line) => line.supplier))).map((name) => ({
+    name,
+    count: filtered.filter((line) => line.supplier === name).length,
+    units: filtered.filter((line) => line.supplier === name).reduce((sum, line) => sum + line.quantity, 0),
+  }));
+  const groupedRows = Array.from(new Set(filtered.map((line) => line.supplierCode || line.supplier))).map((key) => {
+    const groupLines = filtered.filter((line) => (line.supplierCode || line.supplier) === key);
+    return { key, code: groupLines[0]?.supplierCode ?? '', name: groupLines[0]?.supplier ?? key, lines: groupLines };
+  });
+  const approvalsLocked = isStale || busy || calculating || uploadBusy || refreshing;
+  const editedRecommendations = filtered.some((line) => line.quantity !== line.recommendedQty);
+
+  function toggleSupplierSelection(ids: string[], checked: boolean) {
+    setSelectedItemIds((current) => checked
+      ? Array.from(new Set([...current, ...ids]))
+      : current.filter((id) => !ids.includes(id)));
+    if (checked) setLines((current) => current.map((line) => ids.includes(line.id) ? { ...line, reviewed: true } : line));
+  }
+
+  function toggleItemSelection(id: string, checked: boolean) {
+    setSelectedItemIds((current) => checked
+      ? Array.from(new Set([...current, id]))
+      : current.filter((selectedId) => selectedId !== id));
+    if (checked) setLines((current) => current.map((line) => line.id === id ? { ...line, reviewed: true } : line));
+  }
+
+  function toggleVisibleSelection(checked: boolean) {
+    const ids = pendingVisible.map((line) => line.id);
+    setSelectedItemIds((current) => checked
+      ? Array.from(new Set([...current, ...ids]))
+      : current.filter((id) => !ids.includes(id)));
+    if (checked) setLines((current) => current.map((line) => ids.includes(line.id) ? { ...line, reviewed: true } : line));
+  }
+
+  async function refreshLatest() {
+    setRefreshing(true);
+    setError('');
+    try {
+      const latest = await getOrders();
+      setLines(latest.lines);
+      setRunId(latest.runId);
+      setNow(latest.createdAt ? new Date(latest.createdAt) : new Date());
+      setSelectedItemIds([]);
+      setWarehouse('Все склады');
+      setCategory('Все категории');
+      setSupplier('Все поставщики');
+      setUrgency('Любая срочность');
+      setApprovalStatus('Любой статус');
+      setIsStale(false);
+      setStockError('');
+      try {
+        const stock = await getStock();
+        setLines(mergeStock(latest.lines, stock));
+      } catch (cause: unknown) {
+        setStockError(cause instanceof Error ? cause.message : 'Не удалось загрузить складские остатки.');
+      }
+    } catch (cause: unknown) {
+      setError(cause instanceof Error ? cause.message : 'Не удалось обновить последнюю версию рекомендаций.');
+      setIsStale(true);
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  async function runCalculation() {
+    setBusy(true);
+    setCalculating(true);
+    setIsStale(true);
+    setSelectedItemIds([]);
+    setError('');
+    try {
+      const next = await calculate({
+        warehouse: warehouse === 'Все склады' ? undefined : warehouse,
+        category: category === 'Все категории' ? undefined : category,
+      });
+      setRunId(next.runId);
+      setNow(next.createdAt ? new Date(next.createdAt) : new Date());
+      setLines(next.lines);
+      setIsStale(false);
+      setSupplier('Все поставщики');
+      setUrgency('Любая срочность');
+      setApprovalStatus('Любой статус');
+      setStockError('');
+      try {
+        const stock = await getStock(warehouse === 'Все склады' ? undefined : warehouse);
+        setLines(mergeStock(next.lines, stock));
+      } catch (cause: unknown) {
+        setStockError(cause instanceof Error ? cause.message : 'Не удалось загрузить складские остатки.');
+      }
+    } catch (cause: unknown) {
+      setError(cause instanceof Error ? cause.message : 'Не удалось выполнить расчёт.');
+    } finally {
+      setBusy(false);
+      setCalculating(false);
+    }
+  }
+
+  function patchLine(id: string, updates: Partial<OrderLine>) {
+    setLines((current) => current.map((line) => line.id === id && line.status !== 'approved'
+      ? { ...line, ...updates, ...('quantity' in updates ? { reviewed: false } : {}), status: 'pending' }
+      : line));
+  }
+
+  async function approveVisible() {
+    if (approvalsLocked) return;
+    const targetLines = lines.filter((line) => selectedItemIds.includes(line.id) && line.status !== 'approved');
+    if (!targetLines.length || targetLines.some((line) => !line.reviewed)) {
+      setError('Перед подтверждением проверьте каждую позицию.');
+      return;
+    }
+    if (targetLines.some((line) => line.quantity !== line.recommendedQty)) {
+      setError('Текущий API не принимает изменённое количество. Верните расчётное значение перед согласованием.');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      const latest = await getOrders().catch((cause: unknown) => {
+        setIsStale(true);
+        setSelectedItemIds([]);
+        throw cause;
+      });
+      if (latest.runId !== runId) {
+        setLines(latest.lines);
+        setRunId(latest.runId);
+        setNow(latest.createdAt ? new Date(latest.createdAt) : new Date());
+        setSelectedItemIds([]);
+        setIsStale(false);
+        setError('В backend появился новый расчёт. Рекомендации обновлены, отметки проверки сброшены; проверьте позиции перед подтверждением.');
+        return;
+      }
+      const result = await approveOrders(targetLines, { approvedBy, managerNote });
+      const accepted = new Set([...result.approved, ...result.alreadyApproved]);
+      setLines((current) => current.map((line) => accepted.has(line.id)
+        ? { ...line, status: 'approved', reviewed: true, approvedBy: result.approvedBy ?? approvedBy, approvedAt: result.approvalTimestamp }
+        : line));
+      setSelectedItemIds([]);
+    } catch (cause: unknown) {
+      if (cause instanceof Error && 'status' in cause && cause.status === 409) {
+        setIsStale(true);
+        setSelectedItemIds([]);
+        try {
+          const latest = await getOrders();
+          setRunId(latest.runId);
+          setLines(latest.lines);
+          setIsStale(false);
+          setSupplier('Все поставщики');
+          setUrgency('Любая срочность');
+          setApprovalStatus('Любой статус');
+          setError('Расчёт изменился: обновлены актуальные позиции и сброшены отметки проверки. Проверьте их перед повторным согласованием.');
+        } catch (refreshError: unknown) {
+          setError(refreshError instanceof Error ? refreshError.message : 'Позиции устарели; обновите список и попробуйте снова.');
+        }
+      } else {
+        setError(cause instanceof Error ? cause.message : 'Не удалось подтвердить позиции.');
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function exportCsv() {
+    if (!hasApproved) {
+      setError('Сначала подтвердите позиции кнопкой менеджера.');
+      return;
+    }
+    setExportBusy(true);
+    setError('');
+    try {
+      const { blob, filename } = await exportOrders({
+        supplierCode: supplier === 'Все поставщики' ? undefined : supplier,
+        warehouse: warehouse === 'Все склады' ? undefined : warehouse,
+      });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = filename;
+      anchor.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (cause: unknown) {
+      if (cause instanceof Error && 'status' in cause && cause.status === 404) {
+        setError('В текущем расчёте нет подтверждённых позиций для экспорта. Подтвердите заказ или измените фильтры.');
+      } else {
+        setError(cause instanceof Error ? cause.message : 'Не удалось выгрузить файл для 1С.');
+      }
+    } finally {
+      setExportBusy(false);
+    }
+  }
+
+  async function handleUpload(file?: File) {
+    if (!file) return;
+    if (loadingOrders || busy || calculating || refreshing || uploadBusy) {
+      setError('Дождитесь завершения текущей операции перед загрузкой файла.');
+      return;
+    }
+    if (!/\.xlsx$/i.test(file.name)) { setError('Backend принимает только файлы .xlsx.'); return; }
+    if (file.size > 25 * 1024 * 1024) { setError('Размер файла превышает лимит 25 MiB.'); return; }
+    setUploadBusy(true);
+    setIsStale(true);
+    setSelectedItemIds([]);
+    setUploadMessage('');
+    setError('');
+    try {
+      await uploadReport(file);
+      setLines([]);
+      setRunId(null);
+      setSelectedItemIds([]);
+      setStockError('');
+      setSupplier('Все поставщики');
+      setUrgency('Любая срочность');
+      setApprovalStatus('Любой статус');
+      setUploadMessage('Файл загружен. Предыдущий расчёт сброшен; нажмите «Рассчитать», чтобы получить новые рекомендации.');
+      const latest = await getOrders();
+      if (latest.lines.length) throw new Error('После загрузки backend вернул старые рекомендации вместо пустого расчёта. Данные оставлены заблокированными; обновите их перед работой.');
+      setRunId(latest.runId);
+      setNow(latest.createdAt ? new Date(latest.createdAt) : new Date());
+      setIsStale(false);
+    } catch (cause: unknown) {
+      setError(cause instanceof Error ? cause.message : 'Не удалось загрузить отчёт.');
+    } finally {
+      setUploadBusy(false);
+    }
+  }
+
+  return (
+    <div className="luc-app">
+      <header className="luc-topbar">
+        <a className="luc-brand" href="#dashboard" aria-label="Lucrum dashboard">
+          <span className="luc-brand-mark"><Layers3 size={18} /></span>
+          <span>LUCRUM</span>
+        </a>
+        <nav className="luc-topnav" aria-label="Основная навигация">
+          <a className="is-active" href="#dashboard"><LayoutDashboard size={14} /> Dashboard</a>
+          <a href="#orders"><Boxes size={14} /> Orders</a>
+          <a href="#inventory"><WarehouseIcon size={14} /> Inventory</a>
+          <a href="#analytics"><Activity size={14} /> Analytics</a>
+          <a href="#settings"><Settings size={14} /> Settings</a>
+        </nav>
+        <form className="luc-global-search" method="get">
+          <label htmlFor="project-search">Search projects</label>
+          <div><Search size={14} /><input id="project-search" name="q" type="search" placeholder="Search" /></div>
+        </form>
+        <button className="luc-icon-button" type="button" aria-label="Уведомления"><Bell size={16} /><i /></button>
+        <button className="luc-profile" type="button">Менеджер <b>Елена Волкова</b><ChevronDown size={13} /></button>
+      </header>
+
+      <div className="luc-layout">
+        <aside className="luc-sidebar">
+          <section className="luc-company">
+            <b>Elektrokomplekt LLP</b>
+            <span>Supplier order recommendations</span>
+            <span className={`luc-api-status ${serviceStatus}`}><i /> {serviceStatus === 'demo' ? 'Демо API' : serviceStatus === 'checking' ? 'Проверка API' : serviceStatus === 'online' ? 'API доступен' : 'API недоступен'}</span>
+          </section>
+          <div className="luc-filter-title"><SlidersHorizontal size={14} /> ФИЛЬТРЫ</div>
+          <FilterSelect label="Склад" value={warehouse} options={warehouses} onChange={setWarehouse} />
+          <FilterSelect label="Категория" value={category} options={categories} onChange={setCategory} />
+          <FilterSelect label="Поставщик" value={supplier} options={suppliers} onChange={setSupplier} optionLabel={(code) => code === 'Все поставщики' ? code : `${lines.find((line) => line.supplierCode === code)?.supplier ?? code} (${code})`} />
+          <FilterSelect label="Срочность" value={urgency} options={['Любая срочность', 'critical', 'soon', 'planned']} onChange={setUrgency} optionLabel={(value) => ({ critical: 'Высокая', soon: 'Средняя', planned: 'Плановая' }[value] ?? value)} />
+          <FilterSelect label="Согласование" value={approvalStatus} options={['Любой статус', 'Ожидают проверки', 'Проверены', 'Подтверждены']} onChange={setApprovalStatus} />
+          <section
+            className={`luc-upload ${dragging ? 'is-dragging' : ''}`}
+            onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={(event) => { event.preventDefault(); setDragging(false); void handleUpload(event.dataTransfer.files[0]); }}
+          >
+            <FileSpreadsheet size={17} />
+            <b>Загрузить отчёт</b>
+            <span>{uploadMessage || 'Перетащите Excel или выберите файл'}</span>
+            {uploadBusy && <div className="luc-upload-progress" aria-label="Загрузка отчёта"><i /></div>}
+            <label className={`luc-upload-button ${uploadBusy || busy || loadingOrders || refreshing ? 'is-disabled' : ''}`}>{uploadBusy ? <><RefreshCw size={12} className="luc-spin" /> Загружаем…</> : 'Выбрать файл'}<input type="file" accept=".xlsx" disabled={uploadBusy || busy || loadingOrders || refreshing} hidden onChange={(event) => { void handleUpload(event.target.files?.[0]); event.currentTarget.value = ''; }} /></label>
+          </section>
+        </aside>
+
+        <main className="luc-main" id="dashboard">
+          <div className="luc-heading-row">
+            <div>
+              <div className="luc-eyebrow">LUCRUM <span>·</span> УПРАВЛЕНИЕ ПОПОЛНЕНИЕМ</div>
+              <h1>Обзор пополнения</h1>
+              <p>Рекомендации backend по заказам поставщикам. Подтверждайте позиции вручную.</p>
+            </div>
+            <button className="luc-calculate" onClick={runCalculation} disabled={busy || uploadBusy || refreshing || loadingOrders}>
+              <RefreshCw size={15} className={calculating ? 'luc-spin' : ''} /> {calculating ? 'Считаем…' : 'Рассчитать'}
+            </button>
+          </div>
+
+          {isMock && <div className="luc-demo-banner"><CircleAlert size={15} /> Демо-режим: отображаются синтетические данные. Подключите API через <code>VITE_API_BASE_URL</code>.</div>}
+          {!isMock && <div className="luc-contract-note">Коды IEK и SYSTEMELECTRIC могут быть предварительными группировочными кодами, а срок поставки в наборах без явного значения — значением по умолчанию 30 дней.</div>}
+          {isStale && <div className="luc-stale-warning" role="alert"><CircleAlert size={18} /><div><b>Данные расчёта могут быть устаревшими</b><span>{calculating ? 'Выполняется новый расчёт; старые ID уже нельзя согласовывать.' : uploadBusy ? 'Файл загружается; прежние ID будут аннулированы.' : 'Согласование и экспорт заблокированы, пока вы не обновите список последнего расчёта.'}</span></div><button onClick={refreshLatest} disabled={busy || uploadBusy || refreshing || calculating}><RefreshCw size={13} className={refreshing ? 'luc-spin' : ''} /> {refreshing ? 'Обновляем…' : 'Обновить рекомендации'}</button></div>}
+          {error && <div className="luc-error" role="alert"><CircleAlert size={16} /> {error}<button onClick={() => setError('')} aria-label="Закрыть">×</button></div>}
+          {stockError && <div className="luc-contract-note" role="status"><CircleAlert size={14} /> Остатки не загружены: {stockError}</div>}
+
+          <section className="luc-metrics" aria-label="Сводка заказов">
+            <Metric label="Ожидают проверки" value={String(filtered.length - reviewed)} sub="Активные рекомендации" icon={<ClipboardCheck />} tone="blue" />
+            <Metric label="Требуют согласования" value={String(reviewed)} sub={`${reviewed} из ${filtered.length} проверено`} icon={<ShieldCheck />} tone="amber" />
+            <Metric label="Статус экспорта 1С" value={hasApproved ? 'Готов' : 'Ожидает'} sub={hasApproved ? 'Есть согласованные позиции' : 'После подтверждения менеджером'} icon={<FileSpreadsheet />} tone={hasApproved ? 'green' : 'blue'} />
+            <Metric label="Высокая срочность" value={String(urgent)} sub={`${money.format(quantity)} ед. к заказу`} icon={<CircleAlert />} tone="red" />
+          </section>
+
+          <div className="luc-section-heading" id="orders">
+            <div><h2>Активные предложения заказа</h2><p>{filtered.length} позиций · обновлено {new Intl.DateTimeFormat('ru-RU', { hour: '2-digit', minute: '2-digit' }).format(now)}{runId ? ` · Расчёт ${runId.slice(0, 8)}` : ' · расчёт ещё не выполнялся'}</p></div>
+            <button className="luc-export" onClick={exportCsv} disabled={!hasApproved || exportBusy || approvalsLocked}><Download size={14} /> {exportBusy ? 'Готовим CSV…' : 'Экспорт в 1С'}</button>
+          </div>
+
+          <div className="luc-workspace">
+            <section className="luc-table-card" aria-label="Рекомендации к заказу">
+              <div className="luc-table-topline"><span><PackageCheck size={15} /> {supplier === 'Все поставщики' ? 'Все поставщики' : `${lines.find((line) => line.supplierCode === supplier)?.supplier ?? supplier} · ${supplier}`}</span><span>Выбрано: {selectedItemIds.length} · {reviewed}/{filtered.length} проверено</span></div>
+              <div className="luc-table-scroll" aria-busy={loadingOrders || calculating}>
+                <table className="luc-table">
+                  <thead><tr><th><input type="checkbox" className="luc-row-checkbox" aria-label="Выбрать все видимые позиции" checked={allVisibleSelected} disabled={approvalsLocked || pendingVisible.length === 0} onChange={(event) => toggleVisibleSelection(event.target.checked)} /></th><th>SKU / артикул</th><th>Наименование</th><th>Остаток</th><th>В пути</th><th>Спрос / 30 дней</th><th>Поставщик</th><th>К заказу</th><th>Срочность</th><th>Действия</th></tr></thead>
+                  <tbody>
+                    {(loadingOrders || (calculating && !lines.length)) && <tr className="luc-skeleton-row"><td colSpan={10}><span className="luc-skeleton" /><span className="luc-skeleton" /><span className="luc-skeleton" /></td></tr>}
+                    {groupedRows.flatMap((group) => {
+                      const pendingCount = group.lines.filter((line) => line.status !== 'approved').length;
+                      const pendingIds = group.lines.filter((line) => line.status !== 'approved').map((line) => line.id);
+                      const groupSelected = pendingIds.length > 0 && pendingIds.every((id) => selectedItemIds.includes(id));
+                      const groupSelectable = !approvalsLocked && pendingCount > 0;
+                      return [
+                      <tr key={`${group.key}-supplier`} className={`luc-supplier-group ${groupSelected ? 'is-selected' : ''}`}>
+                        <td colSpan={10}>
+                          <label className="luc-supplier-select">
+                            <input type="checkbox" checked={groupSelected} disabled={!groupSelectable} aria-label={`Выбрать все позиции поставщика ${group.name}`} onChange={(event) => toggleSupplierSelection(pendingIds, event.target.checked)} />
+                            <span>Выбрать все позиции</span>
+                          </label>
+                          <b>{group.name}</b><code>{group.code || 'код не задан'}</code>
+                          <span className="luc-group-count">{group.lines.length} позиций · {pendingCount} ожидают согласования · {money.format(group.lines.reduce((sum, line) => sum + line.quantity, 0))} ед.</span>
+                        </td>
+                      </tr>,
+                      ...group.lines.map((line) => (
+                      <tr key={line.id} className={`${line.status === 'approved' ? 'is-approved' : ''} ${isStale ? 'is-stale' : ''}`}>
+                        <td><input type="checkbox" className="luc-row-checkbox" aria-label={`Выбрать ${line.sku} ${line.product}`} checked={line.status === 'approved' || selectedItemIds.includes(line.id)} disabled={line.status === 'approved' || approvalsLocked} onChange={(event) => toggleItemSelection(line.id, event.target.checked)} /></td>
+                        <td><span className="luc-sku">{line.sku}</span><small>{line.bomId ? `BOM ${line.bomId}` : line.category}</small></td>
+                        <td><b className="luc-product">{line.product}</b><small>{line.category}</small><span className="luc-justification" title={`${line.justification}${line.seasonality ? ` · Сезонность: ${line.seasonality}` : ''}${line.moq ? ` · MOQ: ${line.moq}` : ''}`}>{line.justification}{line.seasonality ? ` · ${line.seasonality}` : ''}{line.moq ? ` · MOQ ${line.moq}` : ''}</span></td>
+                        <td><b>{line.stock === undefined ? '—' : money.format(line.stock)}</b><small>{line.stockout ? 'Дефицит' : line.stock === undefined ? 'нет данных' : line.unit}</small></td>
+                        <td><span title="Поле по остаткам в пути отсутствует в текущем API-контракте">—</span><small>нет данных</small></td>
+                        <td><b>{money.format(line.monthlyUse)}</b><small>{line.unit}</small></td>
+                        <td><span className="luc-supplier">{line.supplier}</span><small>{line.supplierCode || 'код не задан'} · {line.warehouse}</small></td>
+                        <td><div className="luc-qty"><input id={`qty-${line.id}`} aria-label={`Количество для ${line.product}`} type="number" min="0" disabled={line.status === 'approved' || approvalsLocked} value={line.quantity} onChange={(event) => patchLine(line.id, { quantity: Math.max(0, Number(event.target.value)) })} /><span>{line.unit}</span></div></td>
+                        <td><Badge className={`luc-priority ${line.urgency}`} variant={line.urgency === 'critical' ? 'error' : line.urgency === 'soon' ? 'warning' : 'success'}>{urgencyName[line.urgency]}</Badge></td>
+                        <td>{line.status === 'approved' ? <Badge className="luc-approved-badge" variant="success"><Check size={12} /> Согласовано</Badge> : <div className="luc-row-actions"><button className={`luc-row-review ${line.reviewed ? 'is-reviewed' : ''}`} disabled={approvalsLocked} onClick={() => patchLine(line.id, { reviewed: !line.reviewed })}>{line.reviewed ? <><Check size={13} /> Проверено</> : 'Проверить'}</button><button className="luc-adjust" disabled={approvalsLocked} onClick={() => document.getElementById(`qty-${line.id}`)?.focus()}>Изменить</button></div>}</td>
+                      </tr>
+                      )),
+                    ];
+                    })}
+                  </tbody>
+                </table>
+                {!loadingOrders && !calculating && !filtered.length && <div className="luc-empty">По выбранным фильтрам позиций нет.</div>}
+              </div>
+              <div className="luc-table-footer"><span>Показано {filtered.length} рекомендаций</span><span><Activity size={13} /> Источник: {isMock ? 'синтетический набор' : 'backend API'}</span></div>
+            </section>
+
+            <aside className="luc-approval-panel">
+              <div className={`luc-approval-status ${hasApproved ? 'is-done' : ''} ${isStale ? 'is-stale' : ''}`}><ShieldCheck size={19} /><span>{isStale ? 'Обновите данные' : allApproved ? 'Все позиции согласованы' : hasApproved ? 'Часть позиций согласована' : 'Требуется согласование'}</span></div>
+              <h3>Подтверждение заказа</h3>
+              <p>{isStale ? 'ID этого расчёта могут быть недействительны. Обновите рекомендации перед согласованием.' : hasApproved ? 'Согласованные позиции отмечены в таблице. Экспорт доступен для передачи в 1С.' : 'Выберите позиции чекбоксами, проверьте количество и подтвердите выбор вручную.'}</p>
+              <label htmlFor="confirmed-count">Выбрано позиций</label>
+              <div className="luc-confirmed-count"><input id="confirmed-count" value={selectedPending.length} readOnly /><span>из {lines.filter((line) => line.status !== 'approved').length}</span></div>
+              <label className="luc-manager-label" htmlFor="approved-by">Ответственный менеджер</label>
+              <input className="luc-manager-input" id="approved-by" value={approvedBy} onChange={(event) => setApprovedBy(event.target.value)} maxLength={120} />
+              <label className="luc-manager-label" htmlFor="manager-note">Заметка к согласованию <span>(необязательно)</span></label>
+              <textarea className="luc-manager-note" id="manager-note" value={managerNote} onChange={(event) => setManagerNote(event.target.value)} maxLength={1000} rows={3} placeholder="Комментарий для журнала согласования" />
+              <small className="luc-note-count">{managerNote.length}/1000</small>
+              {filtered.some((line) => line.quantity !== line.recommendedQty) && <div className="luc-contract-warning"><CircleAlert size={14} /><span>Текущий API подтверждает ID позиций, но не принимает изменённое количество. Верните расчётное количество для согласования.</span><button type="button" onClick={() => setLines((current) => current.map((line) => line.status === 'approved' || line.quantity === line.recommendedQty ? line : { ...line, quantity: line.recommendedQty, reviewed: false }))}>Вернуть расчётное</button></div>}
+              <div className="luc-approval-checklist"><span><Check size={13} /> Количество и срочность проверены</span><span><Check size={13} /> Автоматическая отправка отключена</span></div>
+              <button className="luc-submit" onClick={approveVisible} disabled={approvalsLocked || selectedPending.length === 0 || selectedPending.some((line) => !line.reviewed || line.quantity !== line.recommendedQty)}><ShieldCheck size={14} className={busy ? 'luc-spin' : ''} /> {busy ? 'Подтверждаем…' : `Согласовать выбранные (${selectedPending.length})`}</button>
+              {hasApproved && <button className="luc-submit is-export" onClick={exportCsv} disabled={exportBusy || approvalsLocked}><Download size={14} /> {exportBusy ? 'Готовим файл…' : 'Скачать CSV для 1С'}</button>}
+              <small className="luc-approval-note">Согласование фиксируется только после нажатия менеджером этой кнопки.</small>
+            </aside>
+          </div>
+
+          <div className="luc-analytics" id="analytics">
+            <Card className="luc-analytics-card"><div className="luc-card-heading"><div><h3>Объём по категориям</h3><p>Распределение рекомендованных единиц</p></div><Layers3 size={16} /></div><BarList data={categorySummary.map((item) => ({ name: `${item.name} · ${item.count} поз.`, value: item.units }))} valueFormatter={(value) => `${money.format(value)} ед.`} sortOrder="descending" /></Card>
+            <Card className="luc-analytics-card"><div className="luc-card-heading"><div><h3>Поставщики</h3><p>Рекомендации по текущей выборке</p></div><Boxes size={16} /></div><BarList data={supplierSummary.map((item) => ({ name: `${item.name} · ${item.count} поз.`, value: item.units }))} valueFormatter={(value) => `${money.format(value)} ед.`} sortOrder="descending" /></Card>
+          </div>
+          <footer className="luc-footer"><span>© {new Date().getFullYear()} Elektrokomplekt LLP · Lucrum Order Automation</span><span><ShieldCheck size={13} /> Заказы поставщикам не отправляются автоматически</span></footer>
+        </main>
+      </div>
+    </div>
+  );
 }
-function Metric({label,value,sub,icon,accent}:{label:string,value:string,sub:string,icon:React.ReactNode,accent:string}){return <Card className="metric"><div className={`metric-icon ${accent}`}>{icon}</div><div><span className="metric-label">{label}</span><div className="metric-value">{value}</div><span className="metric-sub">{sub}</span></div><ArrowUpRight className="metric-corner" size={15}/></Card>}
+
+function FilterSelect({ label, value, options, onChange, optionLabel = (option: string) => option }: {
+  label: string;
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
+  optionLabel?: (option: string) => string;
+}) {
+  return <label className="luc-filter"><span>{label}</span><div><select value={value} onChange={(event) => onChange(event.target.value)}>{options.map((option) => <option value={option} key={option}>{optionLabel(option)}</option>)}</select><ChevronDown size={13} /></div></label>;
+}
+
+function Metric({ label, value, sub, icon, tone }: { label: string; value: string; sub: string; icon: ReactNode; tone: string }) {
+  return <Card className="luc-metric"><div className={`luc-metric-icon ${tone}`}>{icon}</div><div className="luc-metric-copy"><span>{label}</span><b>{value}</b><small>{sub}</small></div></Card>;
+}

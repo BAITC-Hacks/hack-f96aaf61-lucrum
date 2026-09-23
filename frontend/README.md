@@ -6,38 +6,26 @@ Frontend for the Elektrokomplekt LLP supplier-order planning workflow. The app p
 
 - **Frontend:** React + TypeScript + Vite. `src/ui` contains the responsive dashboard and review workflow; `src/data/api.ts` is the REST adapter; `src/data/mock.ts` contains clearly labeled synthetic development rows.
 - **Backend:** separate service owned by Executor 1. This frontend treats `/api/calculate` and `/api/orders` as the source of truth. It does not calculate replenishment quantities.
-- **Data flow:** the manager selects warehouse/category and presses **Рассчитать потребность**. The frontend POSTs the scope, displays the returned recommendations and their backend-provided rationale, and permits quantity edits. Every line must be checked as reviewed before **Подтвердить заказ** is enabled. That explicit action marks the displayed recommendations approved in the frontend. Only then is CSV export enabled.
+- **Data flow:** the manager selects warehouse/category and runs a calculation. The frontend stores the returned `run_id` separately from each recommendation's item `id`, reads current stock separately, and displays the backend-provided rationale. Recalculation and successful upload invalidate local review state and lock approval until the new run is loaded. Immediately before approval, the frontend checks the latest `run_id` to catch changes made in another client. Individual checkboxes, the visible select-all checkbox, and supplier-group checkboxes all build an explicit list of item-level IDs; approval sends only those IDs in `item_ids`.
 - **Safety:** no auto-send/dispatch code path exists. Export is local CSV download, never supplier delivery. The REST adapter maps an allow-list of fields into the UI model, rejects invalid records and rejects obvious PII indicators (email, phone-like strings, customer/contact keywords) without echoing the suspect value. Do not add raw API payload logging or pass arbitrary backend fields through the UI/export.
 
 `src/components/OrderApprovalDashboard.vue` is a standalone Vue 3 Composition API version of the manager order workflow. The deployed dashboard entry point remains the React app in `src/ui`; the Vue SFC is not imported into that React tree and expects a Vue-enabled host.
 
-## API integration contract (frontend expectation)
+## API integration contract
 
-Configure `VITE_API_BASE_URL` as the backend origin. Requests use JSON and a 15-second timeout. Errors are shown to the user; the previous result remains visible if recalculation fails.
+The frontend follows the supplied Lucrum backend API guide. Configure `VITE_API_BASE_URL` with the FastAPI origin. During Vite development, `/api` requests are proxied to that origin so the browser makes same-origin requests; production hosting needs a same-origin reverse proxy or backend CORS configuration. Requests have explicit timeouts and display FastAPI `detail` errors.
 
 ### `GET /api/orders`
 
 ```json
 {
-  "lines": [
+  "api_version": "v1",
+  "run_id": "run-uuid",
+  "suppliers": [
     {
-      "id": "opaque-line-id",
-      "sku": "backend-sku",
-      "bomId": "backend-bom-id",
-      "product": "anonymized product description",
-      "category": "category",
-      "supplier": "supplier name/code",
-      "warehouse": "warehouse name/code",
-      "recommendedQty": 24,
-      "unit": "шт",
-      "urgency": "critical",
-      "stock": 8,
-      "monthlyUse": 15,
-      "leadDays": 21,
-      "justification": "backend-generated explanation",
-      "seasonality": "backend-provided optional note",
-      "moq": 12,
-      "status": "pending"
+      "supplier_code": "IEK",
+      "supplier_name": "IEK",
+      "items": [{ "id": "item-uuid", "sku": "SKU-001", "quantity": 18, "status": "pending" }]
     }
   ]
 }
@@ -45,25 +33,41 @@ Configure `VITE_API_BASE_URL` as the backend origin. Requests use JSON and a 15-
 
 ### `POST /api/calculate`
 
-Request (scope fields are optional):
+Optional exact-match filters are query parameters, not a JSON body:
 
-```json
-{ "warehouse": "warehouse name/code", "category": "category" }
+```http
+POST /api/calculate?warehouse=WH-01&category=cables
 ```
 
-Response has the same `lines` structure as `GET /api/orders`, optionally with `calculationId` and `calculatedAt`. The backend owns scope interpretation, recommendation calculation, stock and trend values, urgency, BOM/SKU mapping, and justification. Optional seasonality and MOQ fields may be supplied for display. If Executor 1's final contract differs, update `src/data/api.ts` and this section before integration.
+Response contains `api_version`, `run_id`, `created_at`, and an `orders` array. Each order contains `id`, `sku`, `product_name`, `category`, `warehouse`, `unit`, `supplier_code`, `supplier_name`, `quantity`, `forecast_monthly_demand`, `urgency`, `justification`, and approval metadata. A fresh calculation creates new IDs; prior item selections must be discarded.
 
-### POST /api/orders/approve
+### `POST /api/orders/approve`
 
-A procurement manager must review every displayed line and explicitly confirm it. The frontend sends adjusted quantities as { lines: [{ id, quantity }] }. Only a successful 2xx response marks lines approved. The backend must persist the authenticated approver, time, quantities, and audit event. The UI never calls a supplier-dispatch endpoint.
+The UI sends the explicitly reviewed pending IDs and requires the manager's confirmation click:
+
+```json
+{
+  "item_ids": ["item-uuid"],
+  "supplier_codes": [],
+  "confirmed": true,
+  "approved_by": "manager",
+  "manager_note": "Reviewed"
+}
+```
+
+The frontend submits `approved_by` and `manager_note` with the selected `item_ids`; notes are limited to 1,000 characters. Supplier-group selection is expanded to the visible pending item IDs and does not use the calculation's `run_id` as an item ID. The API does not accept adjusted quantities. The UI therefore blocks approval when a selected quantity differs from the backend recommendation and offers to restore the calculated quantity. A successful response marks accepted IDs approved and enables 1C export for those approved items. Approval is an audit decision only; the backend never dispatches orders to suppliers. A `409` refreshes the latest run and clears selection/review marks.
 
 ## 1C export
 
-GET /api/orders/export-1c returns CSV for approved orders. The frontend validates the CSV content type, UTF-8 semicolon-delimited rows, exact SKU;BOM_ID;WAREHOUSE;SUPPLIER;QUANTITY;UNIT headers, field counts, and obvious PII indicators before download. Unexpected data is rejected without exposing the body. The backend must return approved orders only. Confirm the mapping against the partner 1C template before production.
+`GET /api/orders/export-1c` returns approved items only with columns `SupplierCode, SKU, Quantity, Warehouse` and an attachment filename from the backend. Optional exact filters are `date` (`YYYY-MM-DD`), `supplier_code`, and `warehouse`. The frontend checks content type, headers, field counts, and obvious PII indicators before download. A `404` with `No approved positions found for export` keeps the user in the approval flow.
 
 ### POST /api/upload
 
-The frontend sends one multipart file field named file. It accepts XLSX, XLS, and CSV files up to 25 MB and does not display or log the selected filename or contents. The backend should validate and anonymize partner reports before returning data to the UI.
+The frontend sends one multipart field named `file`. Only `.xlsx` workbooks up to 25 MiB are accepted. Successful upload invalidates the latest calculation; the old rows are removed and the manager must run `/api/calculate` before recommendations appear again. Failed parsing leaves the active backend dataset unchanged and the error is shown.
+
+### `GET /api/health` and `GET /api/stock`
+
+The dashboard checks health on load. `/api/stock` returns `items` with `sku`, `warehouse`, `quantity`, and `stockout`; these are joined by SKU and warehouse. If stock cannot be read, recommendations remain visible and the dashboard reports that stock data is unavailable.
 
 ## Replenishment methodology and outlier exclusion
 
@@ -78,7 +82,7 @@ npm install
 npm run dev
 ```
 
-With `VITE_API_BASE_URL` unset, the app uses clearly labeled synthetic mock rows and simulates a calculation locally. To connect a local backend, copy `.env.example` to `.env.local`, set `VITE_API_BASE_URL=http://localhost:8000` (or the actual backend origin), then restart Vite. The backend must allow the frontend origin through its CORS policy.
+With `VITE_API_BASE_URL` unset, the app uses clearly labeled synthetic mock rows. To connect a local backend, copy `.env.example` to `.env.local`, set `VITE_API_BASE_URL=http://localhost:8000`, keep `VITE_API_PROXY=true`, and restart Vite. The dev server proxies `/api` to FastAPI, avoiding browser CORS during local development. For production, configure a same-origin proxy or enable the correct CORS origin on the backend. Mock mode cannot upload files or export backend approvals.
 
 Production frontend build:
 
@@ -91,10 +95,10 @@ Backend setup/run instructions must be supplied by Executor 1; no backend source
 
 ## Known limitations and assumptions
 
-- API schema above is the frontend's explicit provisional contract, not a discovered backend contract. Reconcile it with Executor 1 before integration.
-- The frontend treats a successful 2xx approval response as accepted. The backend must enforce authorization and persist the approval audit record.
-- The CSV headers are a documented provisional 1C mapping, not verified against a provided partner import template.
+- Approval requests do not carry edited quantities in the documented API, so adjusted quantities cannot be approved until the backend adds support for them.
+- Supplier codes IEK and SYSTEMELECTRIC may be provisional grouping keys rather than verified 1C directory IDs; the backend guide also notes a 30-day default lead time when source workbooks lack explicit lead times.
+- The documented CSV columns are the backend's 1C export contract; verify them against the partner's actual import template before production.
 - PII filtering detects common email/phone/contact indicators. Backend data should be anonymized at source and reviewed against the contract; heuristic checks cannot guarantee detection of every sensitive value.
-- Stock trends in this UI show backend-provided current stock, monthly use and lead time; the demo does not construct historical trend series.
+- Current stock and stockout are read from `/api/stock`; monthly demand comes from the calculation response. In-transit balances and historical stock trends are not included in the supplied API contract.
 - Authentication/authorization and supplier dispatch are outside this frontend; the backend must authorize approvals and validate/anonymize uploaded reports.
-- The supplied source folder had workbooks but no API service, backend technical write-up, or 1C interface specification.
+- A local backend was not bundled with this frontend; start FastAPI separately and ensure `VITE_API_BASE_URL` points to it.
