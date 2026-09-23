@@ -1,0 +1,9 @@
+# Backend calculation methodology
+
+For each SKU and warehouse, the engine aggregates monthly sales, excludes anomalous client purchase groups, compensates recorded stockout months with recent observed median demand, and calculates a recent demand baseline. When sufficient history exists it applies a capped recent-vs-prior trend adjustment and a bounded, blended same-calendar-month seasonal factor. Replenishment covers forecast demand over supplier lead time, less current on-hand and goods in transit; negative needs become zero. Supplier MOQ is applied to positive recommendations. Category and warehouse filters are applied before returning explainable lines.
+
+Anomalies are screened by SKU and anonymized client token: when that client's aggregated purchase quantity exceeds four times the SKU's median monthly quantity, that SKU/client group is excluded from regular-demand fitting. Remaining values are bounded through use of recent means, medians, and capped growth/seasonality factors, reducing the effect of isolated spikes. No client token is returned by the API. The threshold is a documented initial heuristic and should be calibrated against domain-reviewed history.
+
+Stockout periods are matched by SKU, warehouse, and month. The affected month is raised to at least the median of up to six preceding positive monthly observations, so lost sales do not depress the baseline. Where stockout duration is partial-month or there is no preceding history, this monthly approximation is limited and should be interpreted accordingly.
+
+The BOM is retained as a source field for product/component mapping and 1C compatibility; the current recommendation calculation operates on the SKU represented in sales and supplier mappings and does not explode parent demand into components. That expansion needs a confirmed business rule (which BOM level is procured) before it can safely affect quantities.

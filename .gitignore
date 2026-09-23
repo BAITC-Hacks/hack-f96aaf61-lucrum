@@ -1,0 +1,24 @@
+# Partner source workbooks can contain confidential business data.
+/data/raw/*.xlsx
+/data/*.sqlite3
+/data/*.sqlite3-shm
+/data/*.sqlite3-wal
+node_modules/
+/frontend/dist/
+.venv/
+.env
+.env.*
+!.env.example
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.vite/
+.coverage
+.coverage.*
+
+# Local agent/tool configuration; do not commit workstation-specific files.
+/.agents/
+/.codex/
+/skills-lock.json
