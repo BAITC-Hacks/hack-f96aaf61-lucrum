@@ -1,50 +1,246 @@
+````markdown
 # Lucrum
 
-Hackathon project for automated supplier order recommendations for Elektrokomplekt LLP. The service is intended to help a procurement manager review replenishment proposals. It must not place or send orders automatically; a responsible employee must approve them.
+Lucrum is a FastAPI service that helps procurement teams plan warehouse replenishment. It analyzes sales history, stock levels, goods in transit, and supplier terms to recommend quantities for review.
 
-## Source workbooks (`data/raw/`)
+The service addresses two common problems with spreadsheet-based purchasing:
 
-The supplied Excel files are in `data/raw/`. Their names indicate these source roles:
+- Replenishment calculations can be infrequent and difficult to repeat consistently.
+- A one-off large sale can inflate apparent regular demand and distort later orders.
 
-| Workbook(s) | Data needed from it |
+Lucrum smooths isolated sales spikes when estimating regular demand and provides a justification for each recommended line. Recommendations remain **pending until a responsible employee explicitly approves them**. The backend does not send orders to suppliers.
+
+## Project status
+
+The backend includes:
+
+- Monthly demand forecasting with seasonality, capped trend adjustments, and stockout compensation.
+- Anomaly filtering for unusually large purchases associated with an anonymized client token.
+- Replenishment calculations that account for on-hand stock, goods in transit, supplier lead time, and minimum order quantity (MOQ).
+- FastAPI endpoints for calculation, stock status, approvals, and 1C-compatible CSV export.
+- SQLite persistence for calculation runs and approval decisions.
+- XLSX loading from `data/raw/`, with a deterministic synthetic dataset fallback when startup inputs are missing or malformed.
+- An XLSX upload endpoint that reloads the dataset after a successful parse.
+
+## Data sources and mapping
+
+Place partner workbooks in `data/raw/`. The loader scans workbook sheets and checks header rows 0–5 to handle common header offsets. It recognizes source roles from workbook names and, where possible, from column headers.
+
+The supplied files are organized by these source roles:
+
+| Source | Example workbooks | Purpose |
+| --- | --- | --- |
+| Monthly sales | `Ежемесячные продажи в количественном выражении за последние 2 года (2).xlsx`, `Ежемесячные продажи в кол-м выражении SystemElectric 2024-2026 (2).xlsx` | Historical monthly sales by item |
+| Sales dynamics | `Динамика продаж_2025-2026 (2).xlsx`, `Динамика продаж_Syseme Electric_2025-2026 (2).xlsx` | More detailed sales history where available |
+| Historical stock | `Ежемесячные остатки продукции за последние 2 года  ИЭК (2).xlsx`, `Ежемесячные остатки SystemElectric 2024-2026 (2).xlsx` | Stock history for current stock and stockout analysis |
+| Goods in transit | `Путь ИЭК 22.09.2026 (2).xlsx`, `Товар в пути_SystemElectric на 22.09.2026 (2).xlsx` | Incoming quantities |
+| Supplier terms and MOQ | `MOQ  ИЭК (2).xlsx`, `MOQ SystemElectric (2).xlsx` | Product-to-supplier information and minimum order quantities |
+| Seasonality reports | `Сезонность ИЭК (2).xlsx`, `Сезонность SystemElectric 2024-2026 (2).xlsx` | Reference reports; the forecasting engine estimates seasonality from monthly sales history |
+
+Sales-dynamics workbooks are not summed in addition to monthly sales workbooks when both are present, to avoid double-counting. Seasonality reports are not treated as additional sales. The engine estimates seasonal effects from the sales series.
+
+### Data requirements
+
+Use consistent identifiers and units across workbooks:
+
+| Data | Required or useful fields |
 | --- | --- |
-| `Ежемесячные продажи в количественном выражении за последние 2 года (2).xlsx`, `Ежемесячные продажи в кол-м выражении SystemElectric 2024-2026 (2).xlsx` | Historical monthly sales by item, for the ИЭК and SystemElectric ranges |
-| `Динамика продаж_2025-2026 (2).xlsx`, `Динамика продаж_Syseme Electric_2025-2026 (2).xlsx` | Sales dynamics detail; use to clarify or supplement the monthly series where its item/date/quantity grain is needed |
-| `Ежемесячные остатки продукции за последние 2 года  ИЭК (2).xlsx`, `Ежемесячные остатки SystemElectric 2024-2026 (2).xlsx` | Historical stock by item and month; useful for identifying stockout periods and demand censored by zero stock |
-| `Товар в пути_SystemElectric на 22.09.2026 (2).xlsx`, `Путь ИЭК 22.09.2026 (2).xlsx` | Goods in transit by product; latest snapshot dated 22 September 2026 |
-| `MOQ  ИЭК (2).xlsx`, `MOQ SystemElectric (2).xlsx` | Product/supplier minimum order quantities and supplier terms, where included |
-| `Сезонность ИЭК (2).xlsx`, `Сезонность SystemElectric 2024-2026 (2).xlsx` | Seasonal analysis/reports; the calculation can also estimate seasonal pattern from the underlying monthly sales history |
+| Sales | Month or date, SKU/article code, quantity, warehouse when available |
+| Stock | SKU/article code, warehouse, quantity, snapshot date |
+| Goods in transit | SKU/article code, destination warehouse, open quantity; delivery date and status when available |
+| Supplier terms | SKU/article code, supplier code, supplier name, lead time in days, MOQ when applicable |
+| Product details | SKU/article code, product name, category, unit of measure |
+| Stockouts | SKU/article code, warehouse, start date, end date; may be derived from dated zero-stock records |
+| BOM | Parent SKU, component SKU, component quantity, unit of measure, and matching 1C item codes |
 
-These filenames identify the sources, but their worksheet names, headers, and field meanings still need to be mapped. To calculate reliable recommendations, the normalized records need:
+For transaction-level sales data, use one row per sales line. Quantities should be numeric, dates should be actual Excel dates or unambiguous values such as `YYYY-MM-DD`, and product quantities should use a consistent unit of measure.
 
-| Data | Required fields |
+Use anonymized client tokens only, for example `CLIENT_000123`. Do not include customer names, phone numbers, email addresses, physical addresses, or other personally identifiable information. The loader excludes recognized client and contact columns; do not rely on that as a substitute for removing sensitive information before sharing workbooks.
+
+The loader defaults a missing supplier lead time to 30 days and a missing product category to `uncategorized`, with an aggregate warning for missing lead times. It prefers explicit supplier fields when present. The supplied IEK and SystemElectric sales/MOQ books identify product ranges but do not contain a separate legal supplier directory, so the loader currently uses `IEK` and `SYSTEMELECTRIC` as provisional supplier codes/names for those ranges. These are grouping keys, not verified 1C supplier-directory codes; provide an authoritative supplier crosswalk before relying on the export as a production 1C import. The current partner files do not clearly identify a separate lead-time directory or BOM workbook; add and map those sources if they are available. The engine has a BOM data model, but the partner XLSX adapter does not currently load an unmapped BOM workbook.
+
+Do not commit confidential partner workbooks to a public repository. Source XLSX files under `data/raw/` are ignored by Git. Keep shared examples synthetic or appropriately anonymized.
+
+### Loader behavior
+
+- Workbook roles are identified from filenames and, for generic filenames, recognizable headers.
+- The loader selects recognized columns and aggregates sales by SKU, warehouse, and month.
+- Consecutive zero-stock months are converted into stockout intervals.
+- Missing or malformed startup inputs produce a warning and activate the deterministic synthetic dataset.
+- `POST /api/upload` uses strict loading: an invalid workbook is rejected, removed from `data/raw/`, and does not replace the active dataset.
+- After a successful upload, previous recommendations are invalidated. Run a new calculation before approving or exporting recommendations based on the updated data.
+
+## Architecture and technology
+
+- **FastAPI** provides the versioned JSON API and interactive OpenAPI documentation.
+- **Pydantic** defines and validates request and response models.
+- **SQLite**, accessed with Python’s standard-library `sqlite3`, persists calculation runs, recommendation rows, approval status, timestamps, approver identifiers, and manager notes. The project does not currently use SQLAlchemy.
+- **Pandas** and **OpenPyXL** inspect and parse Excel workbooks.
+- **Uvicorn** runs the ASGI application.
+- **Pytest** and FastAPI’s `TestClient` cover engine and API behavior.
+
+Useful references:
+
+- [API contract](docs/API.md)
+- [Calculation methodology](docs/METHODOLOGY.md)
+- [Synthetic sample data](data/sample/README.md)
+
+## Prerequisites
+
+- Python 3.10 or newer
+- Git
+- Access to the partner XLSX files, if testing with real inputs
+
+## Installation
+
+Clone the repository using your project’s repository URL:
+
+```bash
+git clone <repository-url>
+cd Lucrum
+```
+
+Create and activate a virtual environment.
+
+**Windows PowerShell:**
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+**macOS or Linux:**
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Install dependencies:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+To use partner data, place the permitted XLSX workbooks in `data/raw/`. If no usable partner inputs are present, the service starts with synthetic sample data.
+
+## Configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `LUCRUM_RAW_DIR` | `data/raw/` under the repository root | Directory scanned for partner XLSX workbooks |
+| `LUCRUM_DB_PATH` | `data/lucrum.sqlite3` under the repository root | SQLite database path |
+
+Relative override paths are resolved from the application’s current working directory. Set environment variables before starting Uvicorn.
+
+**PowerShell example:**
+
+```powershell
+$env:LUCRUM_RAW_DIR = "C:\path\to\partner-workbooks"
+$env:LUCRUM_DB_PATH = "C:\path\to\lucrum.sqlite3"
+```
+
+## Running the application
+
+From the repository root, start the development server:
+
+```bash
+uvicorn backend.app:app --reload
+```
+
+The service is available at `http://127.0.0.1:8000`. Open Swagger UI at `http://127.0.0.1:8000/docs` or the OpenAPI schema at `http://127.0.0.1:8000/openapi.json`.
+
+Generate the canonical synthetic CSV examples with:
+
+```bash
+python scripts/generate_sample.py
+```
+
+These examples are for development and testing. They are not loaded automatically by the API; the loader’s built-in fallback is generated in memory.
+
+## API overview
+
+| Endpoint | Purpose |
 | --- | --- |
-| Sales | Month/date, SKU/article code, quantity, warehouse (if applicable); anonymized client token if transaction-level client attribution exists |
-| Stock | SKU/article code, warehouse, quantity and snapshot date; historical monthly stock is especially useful for stockout compensation |
-| Goods in transit | SKU/article code, destination warehouse, open quantity; delivery dates/status if available |
-| Supplier terms | SKU/article code, supplier code/name, lead time in days, MOQ if applicable |
-| Products | SKU/article code, product name, category, unit of measure |
-| Stockouts | SKU/article code, warehouse, start and end dates (can be derived from dated stock records when reliable) |
-| BOM | Parent/product SKU, component SKU, component quantity and unit; retain the matching 1C item codes |
+| `GET /api/health` | Health check |
+| `POST /api/calculate` | Calculate recommendations; optional `warehouse` and `category` filters |
+| `GET /api/orders` | Return the latest persisted calculation grouped by supplier |
+| `POST /api/orders/approve` | Explicitly approve pending items by item ID and/or supplier code |
+| `GET /api/orders/export-1c` | Download approved items from the latest calculation as CSV |
+| `POST /api/upload` | Upload an XLSX workbook and reload the active dataset |
+| `GET /api/stock` | Return stock status; optional `warehouse` filter |
 
-The listed workbooks provide sales, stock, transit, MOQ, and seasonality-related sources. A supplier lead-time directory, product/category mapping, and 1C BOM were not identifiable by filename in the supplied set; add them if they are separate files. If supplier or BOM fields are embedded in an existing workbook, record the worksheet and columns that contain them. Preserve source workbooks unchanged and do not add temporary exports or synthetic examples to `data/raw/`.
+See [docs/API.md](docs/API.md) for request and response examples, fields, and error behavior.
 
-### Column and data requirements
+## Core workflow and verification
 
-- Use one row per sales transaction line. Sales history should cover as much history as possible (ideally at least two years to capture seasonality). Include zero-sales/stock availability history if you have it; sales alone cannot reliably distinguish low demand from a stockout.
-- Quantities should be numeric and consistently expressed in the product's unit of measure. Dates should be actual Excel dates or unambiguous dates such as `YYYY-MM-DD`.
-- Use the same SKU/article code and warehouse identifier consistently across all workbooks. Include supplier and 1C codes where available; names alone may not uniquely identify records.
-- Stock and in-transit quantities should represent the latest known snapshot/status. Mark cancelled or closed purchase orders so they are not counted as incoming supply.
-- Client identifiers must already be anonymized (for example, stable generated tokens such as `CLIENT_000123`). Do not include customer names, phone numbers, addresses, email addresses, or other personally identifiable information.
-- If an optional field is not available, leave it blank rather than inventing data. Keep units, currencies, and the meaning of each quantity documented.
+### 1. Load data and calculate recommendations
 
-### Privacy and mapping
+Start Uvicorn and open `/docs`. If using real workbooks, confirm that the server log reports the expected inputs. Otherwise, the synthetic fallback provides sample recommendations.
 
-- Use the same SKU/article code and warehouse identifier across sources; include supplier and 1C codes where available. Document units, currencies, date semantics, and whether monthly quantities mean sales or closing stock.
-- Client identifiers must be anonymized tokens (for example, `CLIENT_000123`). Do not include customer names, phone numbers, addresses, emails, or other personally identifiable information.
-- Do not commit confidential partner XLSX files to a public repository. These source files are local inputs; use an approved private location and keep only anonymized or synthetic data in shared examples.
-- Workbook sheets and header rows are inspected dynamically. The loader selects recognized columns only and never imports client/contact identifiers; it aggregates sales monthly, derives stockout intervals from zero-stock months, and uses the monthly sales series to estimate seasonality rather than treating a seasonality report as additional sales. If monthly sales books exist, similarly named sales-dynamics books are not added to avoid duplicate counting. Unusual source headers may need aliases added. Missing lead times are logged and defaulted to 30 days; missing product categories remain `uncategorized`. See [API contract](docs/API.md) and [sample data](data/sample/README.md).
+In Swagger UI:
 
-## Backend
+1. Run `POST /api/calculate`. Optionally set `warehouse` or `category`.
+2. Note the returned order `id`, `supplier_code`, and `warehouse`.
+3. Use `GET /api/orders` to review lines grouped by supplier, including status and justification.
+4. Do not run another calculation before approving the selected IDs: approvals apply to the latest calculation run.
 
-Install dependencies with `pip install -r requirements.txt`, then run `uvicorn backend.app:app --reload`. At startup the service loads recognized workbooks from `data/raw/`; set `LUCRUM_RAW_DIR` to use another directory. `POST /api/upload` accepts `.xlsx` reports up to 25 MiB and reloads the dataset after a successful parse. If inputs are missing or malformed, it logs a warning and serves the deterministic synthetic sample dataset. SQLite persistence defaults to `data/lucrum.sqlite3`; set `LUCRUM_DB_PATH` to change it. Recommendations remain pending until explicitly approved through the API; approved rows can be downloaded as a 1C-compatible CSV. Replenishment formulas and assumptions are described in [backend methodology](docs/METHODOLOGY.md). Synthetic CSV examples can be generated with `python scripts/generate_sample.py`.
+A new calculation creates new pending recommendation records in SQLite.
+
+### 2. Approve an order explicitly
+
+Use `POST /api/orders/approve` with an item ID or supplier code and explicit confirmation. Example:
+
+```json
+{
+  "item_ids": ["d12a696c-264c-4d63-a59e-639e644208b8"],
+  "supplier_codes": ["SUP-001"],
+  "confirmed": true,
+  "manager_note": "Проверено, товар в наличии",
+  "approved_by": "John Doe"
+}
+```
+
+For the first approval, the response places the ID in `approved` and records the approval timestamp and approver. Repeating the same request returns HTTP 200, places the ID in `already_approved`, and preserves the original approval metadata. An approval records a decision only; it never sends an order to a supplier.
+
+### 3. Export approved positions for 1C
+
+Use `GET /api/orders/export-1c` to download approved positions from the latest calculation. The CSV columns are:
+
+```text
+SupplierCode,SKU,Quantity,Warehouse
+```
+
+`SupplierCode` uses the stored supplier code. If that value is blank or marked unknown, the stored supplier name is used as a fallback. Optional filters are `date` (approval date in `YYYY-MM-DD` format), `supplier_code`, and `warehouse`.
+
+If no approved positions match the latest calculation and filters, the endpoint returns HTTP 404 with:
+
+```json
+{"detail": "No approved positions found for export"}
+```
+
+The export is a file only. It does not transmit orders to suppliers.
+
+### 4. Upload an updated workbook
+
+Use `POST /api/upload` in Swagger UI. Select one `.xlsx` file in the `file` form field. Uploads are limited to 25 MiB. After successful validation, the file is stored under `data/raw/` with a generated filename and the dataset is reloaded. A new calculation is required before approving or exporting recommendations based on the updated data.
+
+## Regression tests
+
+Install project requirements, then run the test suite from the repository root:
+
+```bash
+pytest
+```
+
+The tests cover forecasting behavior, stock and transit effects, stockout compensation, BOM engine behavior, anomaly filtering, API filters, approval idempotency and audit fields, XLSX upload handling, and 1C export mapping and empty-result behavior.
+
+## Persistence and operational notes
+
+- SQLite stores calculation runs and line-item recommendations. New calculations start with `pending` status.
+- Approval records `approved_by`, `approved_at`, `approval_timestamp`, and an optional manager note.
+- Repeating approval is idempotent. Rejected states are permitted by the database schema, though a rejection endpoint is not currently exposed.
+- Approval and export are scoped to the latest calculation run. A new calculation or successful upload makes earlier recommendations ineligible for the current export.
+- The API has no supplier-send endpoint. Procurement staff remain responsible for reviewing and approving recommendations and for any external order submission.
+````

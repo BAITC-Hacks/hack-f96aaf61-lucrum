@@ -35,17 +35,17 @@ Items contain the complete order-line object from `/api/calculate`.
 
 ## `POST /api/orders/approve`
 
-Approves pending item IDs and/or all pending items for the listed supplier codes in the latest calculation. `confirmed: true` is required to represent the manager's explicit confirmation. Approval records a UTC timestamp and optional note; it does not send anything to a supplier.
+Approves pending item IDs and/or all pending items for the listed supplier codes in the latest calculation. `confirmed: true` is required to represent the manager's explicit confirmation. The optional `approved_by` identifier defaults to `manager`; approval records `approved_at` (UTC) and the optional note. Repeating an approval is idempotent and returns HTTP 200 with an `already approved` message. Approval never sends anything to a supplier.
 
 ```json
-{"item_ids": ["c620d134-..."], "supplier_codes": [], "confirmed": true, "manager_note": "Reviewed"}
+{"item_ids": ["d12a696c-264c-4d63-a59e-639e644208b8"], "supplier_codes": ["SUP-001"], "confirmed": true, "manager_note": "Проверено, товар в наличии", "approved_by": "John Doe"}
 ```
 
-The response contains `api_version`, `run_id`, the approved item IDs, `approval_timestamp`, and `status: "approved"`. Missing confirmation returns HTTP 400; no matching pending rows returns HTTP 409.
+The typed response contains `api_version`, `run_id`, newly approved item IDs, already-approved item IDs, their timestamps and approvers, and `status: "approved"`. A repeated approval returns the original timestamp and approver. Missing confirmation returns HTTP 400; no matching rows returns HTTP 409. Swagger includes a ready-to-use example request body.
 
 ## `GET /api/orders/export-1c`
 
-Downloads a UTF-8 CSV containing only approved lines from the latest calculation. Columns are `SupplierCode`, `SKU`, `Quantity`, and `Warehouse`. Exporting never sends an order.
+Downloads a UTF-8 CSV containing only approved lines from the latest calculation. Optional query filters are `date` (approval date, `YYYY-MM-DD`), `supplier_code`, and `warehouse`. The `SupplierCode` value comes from the stored supplier code, falling back to the stored supplier name only when the code is blank or marked unknown. Columns are `SupplierCode`, `SKU`, `Quantity`, and `Warehouse`. No matching approved positions returns HTTP 404. Exporting never sends an order.
 
 ## `POST /api/upload`
 

@@ -62,8 +62,21 @@ class OrderDatabase:
                     status TEXT NOT NULL DEFAULT 'pending'
                         CHECK(status IN ('pending', 'approved', 'rejected')),
                     approval_timestamp TEXT,
+                    approved_by TEXT,
+                    approved_at TEXT,
                     manager_note TEXT
                 )
+            """)
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(recommendations)")}
+            if "approved_by" not in columns:
+                connection.execute("ALTER TABLE recommendations ADD COLUMN approved_by TEXT")
+            if "approved_at" not in columns:
+                connection.execute("ALTER TABLE recommendations ADD COLUMN approved_at TEXT")
+            connection.execute("""
+                UPDATE recommendations
+                SET approved_at = approval_timestamp,
+                    approved_by = COALESCE(approved_by, 'manager')
+                WHERE status = 'approved' AND (approved_at IS NULL OR approved_by IS NULL)
             """)
             connection.execute("CREATE INDEX IF NOT EXISTS idx_recommendations_run ON recommendations(run_id)")
 
@@ -97,7 +110,8 @@ class OrderDatabase:
                       float(order["forecast_monthly_demand"]), order["urgency"],
                       json.dumps(justification, ensure_ascii=False)))
                 output.append({**order, "id": item_id, "status": "pending",
-                               "approval_timestamp": None, "manager_note": None})
+                               "approval_timestamp": None, "approved_by": None,
+                               "approved_at": None, "manager_note": None})
         return {"api_version": "v1", "run_id": run_id, "created_at": created_at, "orders": output}
 
     def latest_orders(self) -> dict[str, Any]:
@@ -115,41 +129,66 @@ class OrderDatabase:
                     "orders": [self._row(row) for row in rows]}
 
     def approve(self, item_ids: list[str], supplier_codes: list[str],
-                manager_note: str | None = None) -> dict[str, Any]:
+                manager_note: str | None = None,
+                approved_by: str = "manager") -> dict[str, Any]:
         """Approve matching pending items in the latest run only."""
-        latest = self.latest_orders()
-        run_id = latest["run_id"]
-        if run_id is None:
-            return {"run_id": None, "approved": [], "approval_timestamp": None}
-        now = datetime.now(timezone.utc).isoformat()
         filters: list[str] = []
-        parameters: list[Any] = [now, manager_note, run_id]
         if item_ids:
             placeholders = ",".join("?" for _ in item_ids)
             filters.append(f"item_id IN ({placeholders})")
-            parameters.extend(item_ids)
         if supplier_codes:
             placeholders = ",".join("?" for _ in supplier_codes)
             filters.append(f"supplier_code IN ({placeholders})")
-            parameters.extend(supplier_codes)
         if not filters:
-            return {"run_id": run_id, "approved": [], "approval_timestamp": None}
+            return {"run_id": None, "approved": [], "already_approved": [], "approval_timestamp": None}
         where = " OR ".join(f"({part})" for part in filters)
+        targets = [*item_ids, *supplier_codes]
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            approved_rows = connection.execute(f"""
-                SELECT item_id FROM recommendations
-                WHERE run_id = ? AND status = 'pending' AND ({where})
+            latest = connection.execute("""
+                SELECT run_id FROM recommendation_runs
+                ORDER BY created_at DESC, rowid DESC LIMIT 1
+            """).fetchone()
+            if latest is None:
+                return {"run_id": None, "approved": [], "already_approved": [], "approval_timestamp": None}
+            run_id = latest["run_id"]
+            matching_rows = connection.execute(f"""
+                SELECT item_id, status, approval_timestamp, approved_at, approved_by FROM recommendations
+                WHERE run_id = ? AND status IN ('pending', 'approved') AND ({where})
                 ORDER BY item_id
-            """, [run_id, *parameters[3:]]).fetchall()
-            cursor = connection.execute(f"""
-                UPDATE recommendations SET status = 'approved', approval_timestamp = ?, manager_note = ?
+            """, [run_id, *targets]).fetchall()
+            now = datetime.now(timezone.utc).isoformat()
+            connection.execute(f"""
+                UPDATE recommendations SET status = 'approved', approval_timestamp = ?,
+                    approved_at = ?, approved_by = ?, manager_note = ?
                 WHERE run_id = ? AND status = 'pending' AND ({where})
-            """, parameters)
-        return {"run_id": run_id, "approved": [row["item_id"] for row in approved_rows],
-                "approval_timestamp": now if cursor.rowcount else None}
+            """, [now, now, approved_by, manager_note, run_id, *targets])
+        approved_ids = [row["item_id"] for row in matching_rows if row["status"] == "pending"]
+        already_approved_ids = [row["item_id"] for row in matching_rows if row["status"] == "approved"]
+        approval_timestamps = {
+            row["item_id"]: (now if row["status"] == "pending" else
+                             row["approved_at"] or row["approval_timestamp"])
+            for row in matching_rows
+            if row["status"] == "pending" or row["approved_at"] or row["approval_timestamp"]
+        }
+        approval_actors = {
+            row["item_id"]: (approved_by if row["status"] == "pending" else row["approved_by"])
+            for row in matching_rows
+        }
+        response_timestamp = (now if approved_ids else
+                              approval_timestamps.get(already_approved_ids[0])
+                              if len(already_approved_ids) == 1 else None)
+        response_actor = (approved_by if approved_ids else
+                          approval_actors.get(already_approved_ids[0])
+                          if len(already_approved_ids) == 1 else None)
+        return {"run_id": run_id, "approved": approved_ids, "already_approved": already_approved_ids,
+                "approval_timestamp": response_timestamp,
+                "approval_timestamps": approval_timestamps,
+                "approved_by": response_actor, "approval_actors": approval_actors}
 
-    def approved_latest(self) -> list[dict[str, Any]]:
+    def approved_latest(self, approval_date: str | None = None,
+                        supplier_code: str | None = None,
+                        warehouse: str | None = None) -> list[dict[str, Any]]:
         with self._connection() as connection:
             run = connection.execute("""
                 SELECT run_id FROM recommendation_runs
@@ -157,9 +196,23 @@ class OrderDatabase:
             """).fetchone()
             if run is None:
                 return []
-            rows = connection.execute("""
-                SELECT item_id, supplier_code, sku, quantity, warehouse FROM recommendations
-                WHERE run_id = ? AND status = 'approved'
+            supplier_value = "CASE WHEN lower(trim(supplier_code)) IN ('', 'unknown', 'unknown supplier') THEN NULLIF(trim(supplier_name), '') ELSE trim(supplier_code) END"
+            clauses = ["run_id = ?", "status = 'approved'", f"{supplier_value} IS NOT NULL",
+                       f"lower({supplier_value}) NOT IN ('unknown', 'unknown supplier')"]
+            parameters: list[Any] = [run["run_id"]]
+            if approval_date:
+                clauses.append("date(COALESCE(approved_at, approval_timestamp)) = ?")
+                parameters.append(approval_date)
+            if supplier_code:
+                clauses.append(f"{supplier_value} = ?")
+                parameters.append(supplier_code)
+            if warehouse:
+                clauses.append("warehouse = ?")
+                parameters.append(warehouse)
+            rows = connection.execute(f"""
+                SELECT item_id, {supplier_value} AS supplier_code, sku, quantity, warehouse
+                FROM recommendations
+                WHERE {' AND '.join(clauses)}
                 ORDER BY supplier_code, sku, warehouse
-            """, (run["run_id"],)).fetchall()
+            """, parameters).fetchall()
             return [dict(row) for row in rows]

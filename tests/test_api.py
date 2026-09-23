@@ -91,19 +91,37 @@ def test_approval_requires_confirmation_and_can_target_supplier(client):
     assert rejected.status_code == 400
 
     response = client.post("/api/orders/approve", json={
-        "supplier_codes": ["SUP-A"], "confirmed": True, "manager_note": "Reviewed by manager"
+        "supplier_codes": ["SUP-A"], "confirmed": True, "manager_note": "Reviewed by manager",
+        "approved_by": "manager-17",
     })
     assert response.status_code == 200
     body = response.json()
     assert body["api_version"] == "v1"
     assert len(body["approved"]) == 1
     assert body["status"] == "approved"
+    assert body["approval_timestamp"]
+    approved_item_id = body["approved"][0]
+    assert body["approval_timestamps"][approved_item_id] == body["approval_timestamp"]
 
     rows = client.get("/api/orders").json()["suppliers"]
     item = next(group["items"][0] for group in rows if group["supplier_code"] == "SUP-A")
     assert item["status"] == "approved"
     assert item["approval_timestamp"]
     assert item["manager_note"] == "Reviewed by manager"
+    assert item["approved_by"] == "manager-17"
+    assert item["approved_at"] == item["approval_timestamp"]
+
+    repeated = client.post("/api/orders/approve", json={
+        "item_ids": [item["id"]], "confirmed": True
+    })
+    assert repeated.status_code == 200
+    assert repeated.json()["message"] == "Item is already approved"
+    assert repeated.json()["already_approved"] == [item["id"]]
+    assert repeated.json()["approval_timestamp"] == body["approval_timestamp"]
+    assert repeated.json()["approval_timestamps"][item["id"]] == body["approval_timestamp"]
+    assert repeated.json()["approved"] == []
+    assert repeated.json()["approved_by"] == "manager-17"
+    assert repeated.json()["approval_actors"][item["id"]] == "manager-17"
 
 
 def test_1c_export_contains_only_approved_items(client):
@@ -116,7 +134,10 @@ def test_1c_export_contains_only_approved_items(client):
     assert approval.status_code == 200
     assert approval.json()["approved"] == [first_item["id"]]
 
-    response = client.get("/api/orders/export-1c")
+    approval_date = approval.json()["approval_timestamp"][:10]
+    response = client.get(
+        f"/api/orders/export-1c?date={approval_date}&supplier_code={first_item['supplier_code']}&warehouse={first_item['warehouse']}"
+    )
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/csv")
     lines = response.text.splitlines()
@@ -127,6 +148,17 @@ def test_1c_export_contains_only_approved_items(client):
         "SupplierCode": first_item["supplier_code"], "SKU": first_item["sku"],
         "Quantity": str(first_item["quantity"]), "Warehouse": first_item["warehouse"],
     }
+
+    unmatched = client.get("/api/orders/export-1c?supplier_code=NO-SUCH-SUPPLIER")
+    assert unmatched.status_code == 404
+    assert unmatched.json()["detail"] == "No approved positions found for export"
+
+
+def test_export_without_approvals_returns_not_found(client):
+    client.post("/api/calculate")
+    response = client.get("/api/orders/export-1c")
+    assert response.status_code == 404
+    assert response.json()["detail"] == "No approved positions found for export"
 
 
 def test_upload_xlsx_reloads_dataset_and_stores_safe_filename(client, tmp_path):

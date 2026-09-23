@@ -21,14 +21,17 @@ from .engine import BomLine, Dataset, Product, SalesMonth, Stock, Stockout, Supp
 logger = logging.getLogger(__name__)
 
 _SKU = ("sku", "артикул", "код товара", "код номенклатуры", "номенклатурный номер",
-        "код продукции", "код позиции", "номенклатура", "код")
+        "номенклатура.код", "код 1с", "код 1c", "код продукции", "код позиции", "внешний код", "код внешний",
+        "артикул производителя", "код товара поставщика", "номенклатура", "код")
 _NAME = ("наименование", "название товара", "продукт", "товар", "номенклатура", "name")
 _QTY = ("количество", "кол-во", "объем", "объём", "остаток", "в пути", "quantity", "qty", "stock")
+_TRANSIT_QTY = ("в пути", "поступление", "поставка до", "ожидаемая поставка", "in transit", "transit")
 _DATE = ("дата", "период", "месяц", "date", "month", "period")
 _WAREHOUSE = ("склад", "warehouse", "филиал", "регион")
 _CATEGORY = ("категория", "группа товара", "товарная группа", "category")
 _SUPPLIER = ("поставщик", "supplier")
-_SUPPLIER_CODE = ("код поставщика", "supplier code", "supplier_code")
+_SUPPLIER_CODE = ("код поставщика", "код контрагента", "код производителя", "supplier code",
+                  "supplier_code", "vendor code", "vendor_code")
 _LEAD = ("срок поставки", "срок поставки дней", "lead time", "lead_time")
 _MOQ = ("moq", "мин заказ", "минимальный заказ", "минимальная партия", "кратность")
 _SENSITIVE = ("клиент", "покупатель", "customer", "client", "фио", "фамилия", "имя клиента",
@@ -41,12 +44,30 @@ def _norm(value: Any) -> str:
 
 
 def _column(frame: pd.DataFrame, aliases: tuple[str, ...]) -> Any | None:
+    if aliases is _SKU:
+        # Prefer a stable item identifier over a description such as
+        # "Номенклатура" or an external supplier article when both are present.
+        preferred = ("номенклатура.код", "код 1с", "код 1c", "код номенклатуры",
+                     "номенклатурный номер", "sku", "код продукции", "код позиции",
+                     "код товара", "код", "артикул", "внешний код", "номенклатура")
+        for alias in preferred:
+            for col in frame.columns:
+                label = _norm(col)
+                is_supplier_code = any(marker in label for marker in
+                                       ("код поставщика", "код контрагента", "supplier code",
+                                        "supplier_code", "vendor code", "vendor_code"))
+                if alias in label and not is_supplier_code and not any(marker in label for marker in _SENSITIVE):
+                    return col
     for alias in sorted(aliases, key=len, reverse=True):
         for col in frame.columns:
             label = _norm(col)
             is_code_label = any(marker in label for marker in ("код", "артикул", "sku"))
+            is_supplier_code = any(marker in label for marker in
+                                   ("код поставщика", "код контрагента", "код производителя",
+                                    "supplier code", "supplier_code", "vendor code", "vendor_code"))
             if (alias in label and not any(marker in label for marker in _SENSITIVE)
-                    and not (aliases is _NAME and is_code_label)):
+                    and not (aliases is _NAME and is_code_label)
+                    and not (aliases is _SKU and is_supplier_code)):
                 return col
     return None
 
@@ -55,7 +76,8 @@ def _safe_header(label: Any) -> bool:
     normalized = _norm(label)
     if any(marker in normalized for marker in _SENSITIVE):
         return False
-    aliases = _SKU + _NAME + _QTY + _DATE + _WAREHOUSE + _CATEGORY + _SUPPLIER + _SUPPLIER_CODE + _LEAD + _MOQ
+    aliases = (_SKU + _NAME + _QTY + _TRANSIT_QTY + _DATE + _WAREHOUSE + _CATEGORY +
+               _SUPPLIER + _SUPPLIER_CODE + _LEAD + _MOQ)
     return any(alias in normalized for alias in aliases) or _month(label) is not None
 
 
@@ -106,6 +128,32 @@ def _text(value: Any, fallback: str = "") -> str:
     if pd.isna(value):
         return fallback
     return str(value).strip()
+
+
+def _supplier_text(value: Any) -> str:
+    """Return a real supplier identifier/name, never a placeholder value."""
+    text = _text(value).strip()
+    if text.casefold() in {"", "nan", "none", "unknown", "unknown supplier"}:
+        return ""
+    return text
+
+
+def _vendor_from_filename(path: Path) -> tuple[str, str] | None:
+    """Infer the product-range supplier key from explicitly named source files.
+
+    The provided sales and MOQ books identify IEK and SystemElectric product
+    ranges but do not contain a legal vendor directory or supplier codes. These
+    stable range keys are therefore used only when row-level supplier fields
+    are absent; explicit source values always take precedence.
+    """
+    name = _norm(path.stem)
+    if "systemelectric" in name or "system electric" in name or "syseme electric" in name:
+        return "SYSTEMELECTRIC", "SystemElectric"
+    if "иэк" in name or re.search(r"(?<![a-z])iek(?![a-z])", name):
+        return "IEK", "IEK"
+    if "ежемесячные продажи в количественном выражении" in name or "ежемесячные остатки продукции" in name:
+        return "IEK", "IEK"
+    return None
 
 
 def _read_sheets(path: Path, require_sku: bool = True) -> list[pd.DataFrame]:
@@ -208,6 +256,10 @@ def _role_from_headers(path: Path) -> str | None:
                 return "sales"
             if any(token in joined for token in ("сезонность", "seasonality")):
                 return "seasonality"
+            # Supplier directories often contain only SKU, supplier name and
+            # supplier code; requiring MOQ/lead-time columns would skip them.
+            if _column(headers, _SUPPLIER) is not None or _column(headers, _SUPPLIER_CODE) is not None:
+                return "moq"
     return None
 
 
@@ -242,7 +294,13 @@ def _load_dataset(raw_dir: str | Path, fallback_on_error: bool = True) -> Datase
             logger.warning("Skipping unrecognized workbook: %s", path.name)
             continue
         try:
-            frames[role].extend(_read_sheets(path, require_sku=role != "seasonality"))
+            parsed_frames = _read_sheets(path, require_sku=role != "seasonality")
+            vendor = _vendor_from_filename(path)
+            if vendor:
+                for frame in parsed_frames:
+                    frame.attrs["lucrum_supplier_code"] = vendor[0]
+                    frame.attrs["lucrum_supplier_name"] = vendor[1]
+            frames[role].extend(parsed_frames)
         except Exception as exc:
             logger.warning("Unable to parse workbook %s (%s: %s); using synthetic sample data.",
                            path.name, type(exc).__name__, exc)
@@ -347,39 +405,86 @@ def _load_dataset(raw_dir: str | Path, fallback_on_error: bool = True) -> Datase
             dataset.stockouts.append(Stockout(sku, wh, run_start, previous))
 
     for frame in frames["transit"]:
-        sku_col, qty_col = _column(frame, _SKU), _column(frame, _QTY)
+        sku_col = _column(frame, _SKU)
+        transit_qty_cols = [col for col in frame.columns
+                            if any(alias in _norm(col) for alias in _TRANSIT_QTY)]
+        if not transit_qty_cols:
+            qty_col = _column(frame, _QTY)
+            transit_qty_cols = [qty_col] if qty_col is not None else []
         wh_col = _column(frame, _WAREHOUSE)
-        if sku_col is None or qty_col is None:
+        if sku_col is None or not transit_qty_cols:
             logger.warning("Skipping transit sheet missing SKU or quantity column.")
-            continue
-        for _, row in frame.iterrows():
-            sku, qty = _text(row[sku_col]), _number(row[qty_col])
-            if sku and qty is not None:
-                wh = _text(row[wh_col], "DEFAULT") if wh_col is not None else "DEFAULT"
-                transit_map[(sku, wh)] += qty
-    dataset.transit = [Transit(sku, wh, qty) for (sku, wh), qty in transit_map.items()]
-
-    for frame in frames["moq"]:
-        sku_col, moq_col = _column(frame, _SKU), _column(frame, _MOQ)
-        supplier_col, supplier_code_col = _column(frame, _SUPPLIER), _column(frame, _SUPPLIER_CODE)
-        lead_col = _column(frame, _LEAD)
-        if sku_col is None:
-            logger.warning("Skipping MOQ sheet without an identifiable SKU column.")
             continue
         for _, row in frame.iterrows():
             sku = _text(row[sku_col])
             if not sku:
                 continue
+            wh = _text(row[wh_col], "DEFAULT") if wh_col is not None else "DEFAULT"
+            for qty_col in transit_qty_cols:
+                qty = _number(row[qty_col])
+                if qty is not None:
+                    transit_map[(sku, wh)] += qty
+    dataset.transit = [Transit(sku, wh, qty) for (sku, wh), qty in transit_map.items()]
+
+    # Supplier attributes may be embedded in a nomenclature, sales, or stock
+    # workbook rather than a dedicated MOQ sheet. Scan all accepted workbook
+    # frames and merge attributes by the normalized product SKU.
+    supplier_frames = [frame for role_frames in frames.values() for frame in role_frames]
+    missing_lead_skus: set[str] = set()
+    for frame in supplier_frames:
+        sku_col, moq_col = _column(frame, _SKU), _column(frame, _MOQ)
+        supplier_col, supplier_code_col = _column(frame, _SUPPLIER), _column(frame, _SUPPLIER_CODE)
+        lead_col = _column(frame, _LEAD)
+        inferred_supplier_code = str(frame.attrs.get("lucrum_supplier_code", ""))
+        inferred_supplier_name = str(frame.attrs.get("lucrum_supplier_name", ""))
+        has_supplier_fields = (supplier_col is not None or supplier_code_col is not None
+                               or bool(inferred_supplier_code))
+        if sku_col is None or (moq_col is None and not has_supplier_fields and lead_col is None):
+            continue
+        for _, row in frame.iterrows():
+            sku = _text(row[sku_col]).strip()
+            if not sku:
+                continue
             moq = _number(row[moq_col]) if moq_col is not None else 0
             lead = _number(row[lead_col]) if lead_col is not None else None
-            supplier_name = _text(row[supplier_col], "Unknown supplier") if supplier_col is not None else "Unknown supplier"
-            supplier_code = _text(row[supplier_code_col], supplier_name) if supplier_code_col is not None else supplier_name
+            supplier_name = _supplier_text(row[supplier_col]) if supplier_col is not None else ""
+            supplier_code = _supplier_text(row[supplier_code_col]) if supplier_code_col is not None else ""
+            previous = moq_map.get(sku)
+            # Preserve real supplier values already collected when a later
+            # workbook carries only MOQ or lead-time data.
+            if not supplier_name and previous:
+                supplier_name = previous.supplier_name
+            if not supplier_code and previous:
+                supplier_code = previous.supplier_code
+            if not supplier_code:
+                supplier_code = inferred_supplier_code
+            if not supplier_name:
+                supplier_name = inferred_supplier_name
+            # If the partner supplies a name but no separate code, use that
+            # real identifier consistently so supplier-based approval works.
+            if supplier_name and not supplier_code:
+                supplier_code = supplier_name
+            if supplier_code and not supplier_name:
+                supplier_name = supplier_code
+            has_supplier_terms = moq_col is not None or lead_col is not None
+            if not supplier_code or not supplier_name:
+                if not has_supplier_terms:
+                    continue
+                # Keep MOQ/lead-time values until a supplier directory row for
+                # the same SKU is encountered in another workbook.
+                supplier_code = supplier_code or ""
+                supplier_name = supplier_name or ""
             moq_map[sku] = Supplier(sku, supplier_code, supplier_name,
-                                    int(lead) if lead is not None and lead > 0 else 30,
-                                    max(0, moq or 0))
-            if lead is None:
-                logger.warning("No lead time for SKU %s; using explicit 30-day default.", sku)
-    dataset.suppliers = list(moq_map.values())
+                                    int(lead) if lead is not None and lead > 0 else
+                                    previous.lead_time_days if previous else 30,
+                                    max(0, max(moq or 0, previous.moq if previous else 0)))
+            if lead is None and previous is None and (has_supplier_fields or has_supplier_terms):
+                missing_lead_skus.add(sku)
+    dataset.suppliers = [supplier for supplier in moq_map.values()
+                         if supplier.supplier_code and supplier.supplier_name]
+    if missing_lead_skus:
+        logger.warning("No lead time for %d supplier SKU(s); using the 30-day default.",
+                       len(missing_lead_skus))
     dataset.products = list(product_map.values())
     logger.info("Loaded partner XLSX data: %d sales, %d stocks, %d transit, %d supplier terms, %d stockouts.",
                 len(dataset.sales), len(dataset.stock), len(dataset.transit), len(dataset.suppliers), len(dataset.stockouts))

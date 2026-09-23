@@ -4,14 +4,16 @@ import io
 import logging
 import os
 import re
+import sqlite3
 import uuid
 import zipfile
 from io import BytesIO
 from contextlib import asynccontextmanager
+from datetime import date as Date
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -26,11 +28,37 @@ _last_calculation = {"api_version": "v1", "orders": []}
 _database: OrderDatabase | None = None
 
 
-class ApprovalRequest(BaseModel):
-    item_ids: list[str] = Field(default_factory=list)
-    supplier_codes: list[str] = Field(default_factory=list)
-    confirmed: bool = False
-    manager_note: str | None = Field(default=None, max_length=1000)
+class OrderApproveRequest(BaseModel):
+    """Explicit manager decision for one or more currently recommended items."""
+
+    item_ids: list[str] = Field(default_factory=list, examples=[["d12a696c-264c-4d63-a59e-639e644208b8"]],
+                                description="Recommendation item IDs to approve.")
+    supplier_codes: list[str] = Field(default_factory=list, examples=[["SUP-001"]],
+                                      description="Approve every pending line for these suppliers in the latest run.")
+    confirmed: bool = Field(default=False, examples=[True],
+                            description="Must be true to record the manager's explicit confirmation.")
+    manager_note: str | None = Field(default=None, max_length=1000,
+                                     examples=["Проверено, товар в наличии"],
+                                     description="Optional note saved with the approval decision.")
+    approved_by: str = Field(default="manager", min_length=1, max_length=200,
+                             examples=["John Doe"], description="Manager name or identifier for the audit trail.")
+
+
+class OrderApproveResponse(BaseModel):
+    api_version: Literal["v1"] = Field(..., examples=["v1"])
+    run_id: str = Field(..., examples=["36f2b240-30c7-463d-a3cf-8a3ba22d2270"])
+    approved: list[str] = Field(..., examples=[["d12a696c-264c-4d63-a59e-639e644208b8"]])
+    already_approved: list[str] = Field(..., examples=[[]])
+    approval_timestamp: str | None = Field(..., examples=["2025-03-08T12:30:00+00:00"])
+    approval_timestamps: dict[str, str] = Field(..., examples=[{
+        "d12a696c-264c-4d63-a59e-639e644208b8": "2025-03-08T12:30:00+00:00"
+    }])
+    approved_by: str | None = Field(..., examples=["John Doe"])
+    approval_actors: dict[str, str | None] = Field(..., examples=[{
+        "d12a696c-264c-4d63-a59e-639e644208b8": "John Doe"
+    }])
+    status: Literal["approved"] = Field(..., examples=["approved"])
+    message: str = Field(..., examples=["Items approved"])
 
 
 def _db() -> OrderDatabase:
@@ -77,25 +105,50 @@ def get_orders() -> dict[str, Any]:
     return {**grouped_orders(latest), "run_id": latest["run_id"]}
 
 
-@app.post("/api/orders/approve")
-def approve_orders(request: ApprovalRequest) -> dict[str, Any]:
+@app.post("/api/orders/approve", response_model=OrderApproveResponse)
+def approve_orders(request: OrderApproveRequest) -> OrderApproveResponse:
     if not request.confirmed:
         raise HTTPException(status_code=400, detail="Explicit manager confirmation is required")
     if not request.item_ids and not request.supplier_codes:
         raise HTTPException(status_code=422, detail="Provide item_ids and/or supplier_codes")
-    result = _db().approve(request.item_ids, request.supplier_codes, request.manager_note)
-    if not result["approved"]:
+    logger.info("Approval request received: item IDs=%s supplier codes=%s approved_by=%s",
+                request.item_ids, request.supplier_codes, request.approved_by)
+    try:
+        result = _db().approve(request.item_ids, request.supplier_codes,
+                               request.manager_note, request.approved_by)
+    except sqlite3.Error as exc:
+        logger.exception("Database error while approving order items")
+        raise HTTPException(status_code=503, detail="Order approval could not be saved") from exc
+    if not result["approved"] and not result["already_approved"]:
         raise HTTPException(status_code=409, detail="No pending matching order items in the latest calculation")
-    logger.info("Approved %d order item(s) in run %s; item IDs=%s",
-                len(result["approved"]), result["run_id"], result["approved"])
-    return {"api_version": "v1", **result, "status": "approved"}
+    if result["already_approved"] and not result["approved"]:
+        message = "Item is already approved" if len(result["already_approved"]) == 1 else "All matching items are already approved"
+    elif result["already_approved"]:
+        message = "Pending items approved; some matching items were already approved"
+    else:
+        message = "Items approved"
+    logger.info("Approval processed for run %s: approved=%d already approved=%d IDs=%s",
+                result["run_id"], len(result["approved"]), len(result["already_approved"]),
+                result["approved"] + result["already_approved"])
+    return OrderApproveResponse(api_version="v1", **result, status="approved", message=message)
 
 
-@app.get("/api/orders/export-1c")
-def export_1c() -> StreamingResponse:
-    rows = _db().approved_latest()
+@app.get("/api/orders/export-1c", responses={404: {"description": "No approved positions found for export"}})
+def export_1c(approval_date: Date | None = Query(default=None, alias="date"),
+              supplier_code: str | None = None,
+              warehouse: str | None = None) -> StreamingResponse:
+    logger.info("1C export requested: date=%s supplier_code=%s warehouse=%s",
+                approval_date, supplier_code, warehouse)
+    try:
+        rows = _db().approved_latest(approval_date.isoformat() if approval_date else None,
+                                     supplier_code, warehouse)
+    except sqlite3.Error as exc:
+        logger.exception("Database error while querying approved items for 1C export")
+        raise HTTPException(status_code=503, detail="Approved orders could not be read for export") from exc
     logger.info("1C export found %d approved order item(s); item IDs=%s",
                 len(rows), [row["item_id"] for row in rows])
+    if not rows:
+        raise HTTPException(status_code=404, detail="No approved positions found for export")
     output = io.StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=["SupplierCode", "SKU", "Quantity", "Warehouse"])
     writer.writeheader()
